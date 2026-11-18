@@ -37,7 +37,7 @@
 
 | 平台 | 文件 | 说明 |
 | --- | --- | --- |
-| Windows | `FuckZhihuishuPro-vX.Y.Z-portable.zip` | 免安装，解压即用（推荐发同学用这个） |
+| Windows | `FuckZhihuishuPro-vX.Y.Z-portable.zip` | 免安装，解压即用 |
 | Windows | `FuckZhihuishuPro_X.Y.Z_x64-setup.exe` | 安装版 |
 | macOS | `FuckZhihuishuPro_X.Y.Z_universal.dmg` | 同时支持 Apple Silicon 和 Intel 芯片 |
 
