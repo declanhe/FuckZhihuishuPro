@@ -1,0 +1,146 @@
+:root {
+  --green: #07c05f;
+  --green-dark: #059a4b;
+  --green-light: #e8f9f0;
+  --bg: #f4f6f8;
+  --card: #ffffff;
+  --text: #26323a;
+  --text-sub: #7a8a94;
+  --danger: #e5484d;
+  --warn: #f5a623;
+  --radius: 12px;
+  /* 组件级补充变量（浅色默认值） */
+  --input-bg: #ffffff;
+  --input-border: #d7dee3;
+  --tab-bg: #eef1f3;
+  --tab-active-bg: #ffffff;
+  --tab-active-shadow: rgba(0, 0, 0, 0.08);
+  --card-shadow: rgba(0, 0, 0, 0.06);
+  --progress-track: #eef1f3;
+  --log-bg: #f8fafb;
+  --scroll-thumb: #cfd8dc;
+  --scroll-thumb-hover: #b0bec5;
+  font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+  color: var(--text);
+}
+
+/* 黑暗模式：html.dark 时覆盖变量 */
+html.dark {
+  --green-light: #0e2b1d;
+  --bg: #14181c;
+  --card: #1d2329;
+  --text: #dfe6ea;
+  --text-sub: #8fa0ab;
+  --input-bg: #262e35;
+  --input-border: #3a4450;
+  --tab-bg: #232a31;
+  --tab-active-bg: #1d2329;
+  --tab-active-shadow: rgba(0, 0, 0, 0.4);
+  --card-shadow: rgba(0, 0, 0, 0.35);
+  --progress-track: #2a323a;
+  --log-bg: #171d22;
+  --scroll-thumb: #3a4450;
+  --scroll-thumb-hover: #4a5663;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  border-radius: 8px;
+  transition: filter 0.15s ease, opacity 0.15s ease;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--green);
+  color: #fff;
+  font-size: 16px;
+  padding: 10px 24px;
+  font-weight: 600;
+}
+
+.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.btn-ghost {
+  background: var(--green-light);
+  color: var(--green-dark);
+  padding: 8px 18px;
+  font-size: 14px;
+}
+
+.btn-danger {
+  background: var(--green-light);
+  color: var(--danger);
+  padding: 8px 18px;
+  font-size: 14px;
+}
+
+html.dark .btn-danger {
+  background: #3a1d1f;
+}
+
+input[type="text"],
+input[type="password"],
+select {
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid var(--input-border);
+  border-radius: 8px;
+  font-size: 14px;
+  outline: none;
+  background: var(--input-bg);
+  color: var(--text);
+  font-family: inherit;
+}
+
+input:focus,
+select:focus {
+  border-color: var(--green);
+}
+
+input[type="checkbox"] {
+  accent-color: var(--green);
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+.card {
+  background: var(--card);
+  border-radius: var(--radius);
+  box-shadow: 0 1px 4px var(--card-shadow);
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+}

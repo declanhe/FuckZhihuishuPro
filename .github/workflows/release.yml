@@ -1,0 +1,68 @@
+# 双平台发布构建：打 v* 标签时自动构建 Windows + macOS 并发 GitHub Release
+# （本机无法交叉编译 macOS，mac 产物一律走这里的 CI）
+name: Release Build
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "windows-latest"
+            args: ""
+          - platform: "macos-latest"
+            # universal 二进制：一个 dmg 同时支持 Apple Silicon 和 Intel
+            args: "--target universal-apple-darwin --bundles dmg"
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build & create GitHub Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "FuckZhihuishuPro ${{ github.ref_name }}"
+          releaseBody: "Windows：下载 -portable.zip（免安装，发同学用这个）或 -setup.exe。macOS：下载 .dmg（未签名，首次打开请右键 → 打开）。"
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      # 便携 zip（exe + README.txt 平铺，全 ASCII 文件名）由 CI 统一打包附加到 Release
+      - name: Pack portable zip (Windows only)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          Copy-Item src-tauri/target/release/fuckzhihuishupro.exe FuckZhihuishuPro.exe
+          Copy-Item 使用说明.txt README.txt
+          Compress-Archive -Path FuckZhihuishuPro.exe, README.txt -DestinationPath FuckZhihuishuPro-portable.zip -Force
+          gh release upload ${{ github.ref_name }} FuckZhihuishuPro-portable.zip --clobber

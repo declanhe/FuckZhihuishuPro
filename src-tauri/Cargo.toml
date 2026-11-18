@@ -1,0 +1,55 @@
+[package]
+name = "fuckzhihuishupro"
+version = "1.0.0"
+description = "FuckZhihuishuPro - 智慧树刷课助手，集 fuckZHS 与 Autovisor 之大成"
+authors = ["Declan He"]
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "fuckzhihuishupro_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# HTTP 客户端（对应 fuckZHS 的 requests）
+reqwest = { version = "0.12", features = ["json", "cookies", "gzip", "brotli", "socks"] }
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+# 加密（对应 zd_utils.py 的 AES-CBC 与 sign.py 的 MD5）
+aes = "0.8"
+cbc = { version = "0.1", features = ["std"] }
+md-5 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+# 数据处理与工具
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.9"
+thiserror = "2"
+# 日志
+log = "0.4"
+
+# 内嵌浏览器登录：直接操作 WebView2 CookieManager（Windows 专属，macOS 无此 API）
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com"] }
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
