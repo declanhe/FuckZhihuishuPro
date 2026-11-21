@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use super::crypto::{self, VIDEO_KEY, HOME_KEY};
 use super::error::{Result, ZhsError};
-use super::events::{sleep_or_stop, CourseEvent, Emitter, StopToken};
+use super::events::{sleep_or_stop, CourseEvent, Emitter, PauseToken, StopToken};
 use super::session::{b64_encode, ev_encode, now_ms, ZhsSession};
 
 const LIST_URL: &str =
@@ -181,6 +181,8 @@ pub struct ZhidaoRunner {
     /// 单课时限（秒，0 = 不限）
     pub limit_seconds: u64,
     pub stop: StopToken,
+    /// 全局暂停（引擎级）：暂停时视频循环冻结进度
+    pub pause: PauseToken,
     ctx: Option<ZhidaoContext>,
     /// 本轮累计学习秒数（时限用）
     fucked_time: u64,
@@ -193,6 +195,7 @@ impl ZhidaoRunner {
         end_thre: f64,
         limit_minutes: u64,
         stop: StopToken,
+        pause: PauseToken,
     ) -> Self {
         Self {
             session,
@@ -200,6 +203,7 @@ impl ZhidaoRunner {
             end_thre,
             limit_seconds: limit_minutes * 60,
             stop,
+            pause,
             ctx: None,
             fucked_time: 0,
         }
@@ -209,16 +213,9 @@ impl ZhidaoRunner {
         self.speed
     }
 
-    /// 获取（或缓存）课程上下文。
-    pub async fn context(&mut self, rac_id: &str, emit: &Emitter) -> Result<ZhidaoContext> {
-        if let Some(ctx) = &self.ctx {
-            if ctx.rac_id == rac_id {
-                return Ok(ctx.clone());
-            }
-        }
-        emit.emit(CourseEvent::log(format!("正在加载课程 {rac_id} …")));
-
-        // 跨站登录
+    /// 跨站登录（对应 `gologin`）：建立 studyservice 学习会话。
+    /// 会话失效（NotLoggedIn）时重新调用即可自愈，无需用户重新扫码。
+    async fn gologin(&self, rac_id: &str) -> Result<()> {
         let fromurl = format!(
             "https://studyh5.zhihuishu.com/videoStudy.html#/studyVideo?recruitAndCourseId={rac_id}"
         );
@@ -228,7 +225,26 @@ impl ZhidaoRunner {
             .query(&[("fromurl", fromurl)])
             .headers(parse_headers(STUDY_HEADERS))
             .send()
-            .await?;
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// 获取（或缓存）课程上下文。
+    pub async fn context(&mut self, rac_id: &str, emit: &Emitter) -> Result<ZhidaoContext> {
+        if let Some(ctx) = &self.ctx {
+            if ctx.rac_id == rac_id {
+                return Ok(ctx.clone());
+            }
+        }
+        emit.emit(CourseEvent::logc(
+            "loading_course",
+            format!("正在加载课程 {rac_id} …"),
+            rac_id,
+        ));
+
+        // 跨站登录（studyservice 学习会话；过期后重新调用即可恢复）
+        self.gologin(rac_id).await?;
 
         // 课程信息
         let course = self
@@ -341,7 +357,11 @@ impl ZhidaoRunner {
     /// 刷整门课程（对应 `fuckZhidaoCourse`）。
     pub async fn run_course(&mut self, rac_id: &str, emit: &Emitter) -> Result<()> {
         let ctx = self.context(rac_id, emit).await?;
-        emit.emit(CourseEvent::log(format!("开始刷课：{}", ctx.course_name)));
+        emit.emit(CourseEvent::logc(
+            "start_course",
+            format!("开始刷课：{}", ctx.course_name),
+            &ctx.course_name,
+        ));
 
         for video in ctx.videos.clone().iter() {
             emit.emit(CourseEvent::Lesson {
@@ -365,14 +385,30 @@ impl ZhidaoRunner {
                 }
             }
         }
-        emit.emit(CourseEvent::Done {
-            msg: format!("课程 {} 已完成", ctx.course_name),
-        });
+        emit.emit(CourseEvent::done(
+            "course_finished",
+            format!("课程 {} 已完成", ctx.course_name),
+        ));
         Ok(())
     }
 
     /// 刷单个视频（对应 `fuckZhidaoVideo`）。
+    /// 学习会话失效（长时间挂机后 gologin 会话过期）时自动恢复并重试一次。
     pub async fn run_video(&mut self, rac_id: &str, video_id: &str, emit: &Emitter) -> Result<()> {
+        match self.run_video_inner(rac_id, video_id, emit).await {
+            Err(ZhsError::NotLoggedIn) => {
+                emit.emit(CourseEvent::log("学习会话失效，正在自动恢复…"));
+                self.ctx = None;
+                self.context(rac_id, emit).await?;
+                self.run_video_inner(rac_id, video_id, emit).await
+            }
+            other => other,
+        }
+    }
+
+    async fn run_video_inner(&mut self, rac_id: &str, video_id: &str, emit: &Emitter) -> Result<()> {
+        // 全局暂停：等恢复后再进入下一个视频
+        self.pause.wait_resume().await;
         self.check_limit()?;
         let ctx = self.context(rac_id, emit).await?;
         let Some(video) = ctx.videos.iter().find(|v| v.video_id == video_id).cloned() else {
@@ -382,7 +418,7 @@ impl ZhidaoRunner {
         if video.watch_state == 1.0 && self.end_thre <= 1.0 {
             emit.emit(CourseEvent::Skipped {
                 name: video.name.clone(),
-                reason: "已看完".into(),
+                reason: "watched".into(),
             });
             return Ok(());
         }
@@ -461,26 +497,38 @@ impl ZhidaoRunner {
         let mut answer: Option<u32> = None;
         let mut question: Option<Value> = None;
         let mut report = false;
-        let mut pause: i64 = 0;
+        let mut human_pause: i64 = 0; // 随机模拟人类暂停（区别于全局暂停）
+        let mut relogged = false; // 学习会话自愈：每个视频最多恢复一次
         let mut wp = crypto::WatchPoint::new();
 
         while played_time < end_time {
             if sleep_or_stop(1.0, &self.stop).await {
                 return Err(ZhsError::Stopped);
             }
+            // 全局暂停（用户操作）：冻结进度，不上报、不计入时限
+            if self.pause.is_paused() {
+                emit.emit(CourseEvent::VideoProgress {
+                    video_id: video.video_id.clone(),
+                    played: played_time,
+                    total: end_time,
+                    paused: true,
+                    quiz: answer.is_some(),
+                });
+                continue;
+            }
             self.fucked_time += 1;
             self.check_limit()?;
             elapsed_time += 1;
             played_time = (played_time + self.speed()).min(end_time);
             // 随机暂停一分钟，模拟人类行为（对应 random() < 0.0025）
-            if pause == 0 && rand::rng().random::<f64>() < 0.0025 {
-                pause = 60;
+            if human_pause == 0 && rand::rng().random::<f64>() < 0.0025 {
+                human_pause = 60;
             }
-            if pause == 60 {
+            if human_pause == 60 {
                 report = true;
             }
-            if pause > 0 {
-                pause -= 1;
+            if human_pause > 0 {
+                human_pause -= 1;
                 played_time = last_submit;
             }
             if elapsed_time % 2 == 0 {
@@ -531,8 +579,8 @@ impl ZhidaoRunner {
                         }
                     }
                 } else {
-                    if pause == 0 {
-                        pause = 1;
+                    if human_pause == 0 {
+                        human_pause = 1;
                     }
                     answer = Some(a - 1);
                 }
@@ -562,6 +610,14 @@ impl ZhidaoRunner {
                         emit.emit(CourseEvent::CaptchaRequired);
                         return Err(ZhsError::Captcha);
                     }
+                    // 学习会话失效：重新跨站登录，下个周期重报（每个视频最多一次）
+                    if matches!(e, ZhsError::NotLoggedIn) && !relogged {
+                        relogged = true;
+                        emit.emit(CourseEvent::log("学习会话失效，正在自动恢复…"));
+                        if self.gologin(rac_id).await.is_ok() {
+                            continue;
+                        }
+                    }
                     emit.emit(CourseEvent::Failed {
                         msg: format!("进度上报失败（将继续尝试）: {e}"),
                     });
@@ -574,7 +630,7 @@ impl ZhidaoRunner {
                 video_id: video.video_id.clone(),
                 played: played_time,
                 total: end_time,
-                paused: pause > 0,
+                paused: human_pause > 0,
                 quiz: answer.is_some(),
             });
         }

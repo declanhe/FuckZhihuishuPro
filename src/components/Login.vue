@@ -4,7 +4,7 @@
       <div class="logo">
         <div class="logo-mark">知</div>
         <h1>FZHS Pro</h1>
-        <p class="slogan">把网课丢给它，你去吃点好的</p>
+        <p class="slogan">{{ t("login.slogan") }}</p>
       </div>
 
       <div class="tabs">
@@ -12,14 +12,14 @@
           :class="{ active: mode === 'qr' }"
           @click="switchMode('qr')"
         >
-          扫码登录（推荐）
+          {{ t("login.tabQr") }}
         </button>
         <button
           v-if="!isMac"
           :class="{ active: mode === 'pwd' }"
           @click="switchMode('pwd')"
         >
-          浏览器登录
+          {{ t("login.tabBrowser") }}
         </button>
       </div>
 
@@ -29,36 +29,32 @@
           <img
             v-if="qrImg"
             :src="qrImg"
-            alt="登录二维码"
+            :alt="t('login.qrAlt')"
             :class="{ dim: qrScanned }"
           />
-          <div v-else class="qr-loading">{{ qrError || "正在获取二维码…" }}</div>
-          <div v-if="qrScanned" class="qr-overlay">✓ 已扫码<br />确认后正在登录…</div>
+          <div v-else class="qr-loading">{{ qrError || t("login.qrFetching") }}</div>
+          <div v-if="qrScanned" class="qr-overlay" v-html="t('login.qrScanned')"></div>
         </div>
-        <p class="qr-hint">📱 打开<b>知到 APP</b>，扫一扫上面的二维码</p>
+        <p class="qr-hint" v-html="t('login.qrHint')"></p>
         <p class="hint warn-hint" v-if="qrError && qrImg">{{ qrError }}</p>
         <button class="btn-ghost" @click="startQr" :disabled="!qrImg && qrLoading">
-          刷新二维码
+          {{ t("login.qrRefresh") }}
         </button>
       </div>
 
       <!-- 浏览器登录：主窗口切换到智慧树登录页，账号密码/滑块/短信都在网页里完成 -->
       <div v-else class="pwd-panel">
-        <p class="hint browser-hint">
-          点击下方按钮后，本窗口会变成智慧树登录页面。<br />
-          在页面里输入账号密码（需要滑块/短信验证也直接完成），<br />
-          <b>登录成功后本程序会自动返回并进入主界面</b>。
-        </p>
+        <p class="hint browser-hint" v-html="t('login.browserHint')"></p>
         <button class="btn-primary" @click="openBrowser" :disabled="browserOpening">
-          {{ browserOpening ? "正在打开…" : "打开登录页面" }}
+          {{ browserOpening ? t("login.opening") : t("login.openBrowser") }}
         </button>
         <p class="hint warn-hint" v-if="pwdError">{{ pwdError }}</p>
-        <p class="hint">推荐使用「扫码登录」，无需输入账号密码更安全。</p>
+        <p class="hint">{{ t("login.browserTip") }}</p>
       </div>
     </div>
 
     <p class="footer">
-      仅供学习交流 · 请合理安排时间 · 本工具不上传任何数据到第三方
+      {{ t("login.footer") }}
     </p>
   </div>
 </template>
@@ -67,6 +63,7 @@
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { api, parseErr } from "../api";
+import { t } from "../i18n";
 
 const emit = defineEmits<{ done: [] }>();
 
@@ -96,7 +93,7 @@ async function startQr() {
     qrImg.value = `data:image/png;base64,${r.img}`;
     pollQr();
   } catch (e) {
-    qrError.value = parseErr(e).message + "（点此重试）";
+    qrError.value = parseErr(e).message + t("login.retry");
   } finally {
     qrLoading.value = false;
   }
@@ -121,17 +118,17 @@ async function pollQr() {
     polling = false;
     if (err.kind === "qr_cancelled") {
       stopPoll();
-      qrError.value = "已在手机上取消登录，请点下方按钮刷新二维码重试";
+      qrError.value = t("login.cancelled");
       return;
     }
     if (err.kind === "qr_expired") {
       // 过期自动刷新，并给出可见提示（避免看起来"没反应"）
-      qrError.value = "二维码已过期，正在自动刷新…";
+      qrError.value = t("login.expired");
       await startQr();
       return;
     }
     // 网络/其他错误：提示原因，停留在当前页等待用户手动重试
-    qrError.value = err.message + "（请检查网络后点下方按钮重试）";
+    qrError.value = err.message + t("login.netRetry");
   }
 }
 
@@ -313,6 +310,7 @@ startQr();
   font-size: 16px;
   font-weight: 600;
   line-height: 1.8;
+  text-align: center;
 }
 
 .hint {

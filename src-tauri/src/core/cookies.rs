@@ -21,10 +21,21 @@ pub struct StoredCookie {
     pub host_only: bool,
     pub path: String,
     pub secure: bool,
-    /// 过期时间戳（秒）；None = 会话 cookie。仅记录，存储层不做过期淘汰。
+    /// 过期时间戳（秒）；None = 会话 cookie。
     #[serde(default)]
-    #[allow(dead_code)]
     pub expires: Option<i64>,
+}
+
+impl StoredCookie {
+    /// 是否已过期（相对当前时间）。
+    fn expired(&self, now: i64) -> bool {
+        self.expires.is_some_and(|e| e <= now)
+    }
+}
+
+/// 当前 Unix 时间戳（秒）。
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 #[derive(Debug, Default)]
@@ -51,10 +62,14 @@ impl MemoryCookieStore {
         self.inner.lock().unwrap().clone()
     }
 
-    /// 导入 cookie（覆盖同名项）。
+    /// 导入 cookie（覆盖同名项；已过期的直接丢弃）。
     pub fn import(&self, cookies: Vec<StoredCookie>) {
+        let now = now_secs();
         let mut inner = self.inner.lock().unwrap();
         for c in cookies {
+            if c.expired(now) {
+                continue;
+            }
             match inner.iter_mut().find(|x| {
                 x.name == c.name && x.domain == c.domain && x.path == c.path
             }) {
@@ -165,8 +180,30 @@ impl CookieStore for MemoryCookieStore {
                     }
                     "path" if val.starts_with('/') => cookie.path = val,
                     "secure" => cookie.secure = true,
+                    // 过期属性此前被完全忽略：服务器用过期 Set-Cookie 清除会话
+                    // cookie 的指令失效，过期 cookie 也会一直被发送。现在记录之。
+                    "expires" if !val.is_empty() => {
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(&val) {
+                            cookie.expires = Some(dt.timestamp());
+                        }
+                    }
+                    "max-age" if !val.is_empty() => {
+                        if let Ok(secs) = val.parse::<i64>() {
+                            cookie.expires = Some(now_secs() + secs);
+                        }
+                    }
                     _ => {}
                 }
+            }
+            // 已过期（服务器要求清除）：删除同名项且不再存入
+            let now = now_secs();
+            if cookie.expired(now) {
+                inner.retain(|x| {
+                    !(x.name == cookie.name
+                        && x.domain == cookie.domain
+                        && x.path == cookie.path)
+                });
+                continue;
             }
             // upsert: 同 (name, domain, path) 覆盖
             match inner.iter_mut().find(|x| {
@@ -179,10 +216,11 @@ impl CookieStore for MemoryCookieStore {
     }
 
     fn cookies(&self, url: &Url) -> Option<HeaderValue> {
+        let now = now_secs();
         let inner = self.inner.lock().unwrap();
         let pairs: Vec<String> = inner
             .iter()
-            .filter(|c| self.matches(url, c))
+            .filter(|c| !c.expired(now) && self.matches(url, c))
             .map(|c| format!("{}={}", c.name, c.value))
             .collect();
         if pairs.is_empty() {

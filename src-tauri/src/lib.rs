@@ -130,7 +130,7 @@ pub fn run() {
                     "show" => show_main_window(app),
                     "quit" => {
                         if let Some(state) = app.try_state::<AppState>() {
-                            state.engine.stop_all();
+                            state.engine.stop_all(app);
                         }
                         app.exit(0);
                     }
@@ -151,14 +151,26 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 所有窗口关闭 -> 隐藏到托盘（主窗口后台刷课；登录窗口同理不退出）
-            // 仅"退出程序"托盘菜单会真正结束进程
+            // 「最小化到托盘」开启：关窗 -> 隐藏到托盘，后台继续刷课；
+            // 关闭：点 × 直接退出（与托盘"退出程序"一致：停任务 + exit）
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "browser-login" {
                     return; // 登录窗口允许直接关闭
                 }
-                let _ = window.hide();
-                api.prevent_close();
+                let app = window.app_handle();
+                let minimize = app
+                    .try_state::<AppState>()
+                    .map(|s| s.config.lock().unwrap().minimize_to_tray)
+                    .unwrap_or(true);
+                if minimize {
+                    let _ = window.hide();
+                    api.prevent_close();
+                } else {
+                    if let Some(state) = app.try_state::<AppState>() {
+                        state.engine.stop_all(app);
+                    }
+                    app.exit(0);
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -174,6 +186,9 @@ pub fn run() {
             commands::stop_course,
             commands::stop_all_courses,
             commands::get_running,
+            commands::get_queue_state,
+            commands::set_queue_paused,
+            commands::clear_queue,
             commands::get_config,
             commands::save_config,
             commands::self_test,

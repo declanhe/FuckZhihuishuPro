@@ -8,7 +8,7 @@ use rand::Rng;
 use serde_json::{json, Value};
 
 use super::error::{Result, ZhsError};
-use super::events::{sleep_or_stop, CourseEvent, Emitter, StopToken};
+use super::events::{sleep_or_stop, CourseEvent, Emitter, PauseToken, StopToken};
 use super::session::{now_ms, ZhsSession};
 
 const COURSE_LIST_URL: &str = "https://hikeservice.zhihuishu.com/student/course/aided/getMyCourseList";
@@ -77,6 +77,8 @@ pub struct HikeRunner {
     /// 单课时限（秒，0 = 不限）
     pub limit_seconds: u64,
     pub stop: StopToken,
+    /// 全局暂停（引擎级）：暂停时视频循环冻结进度
+    pub pause: PauseToken,
     root: Option<Value>,
     fucked_time: u64,
 }
@@ -88,6 +90,7 @@ impl HikeRunner {
         end_thre: f64,
         limit_minutes: u64,
         stop: StopToken,
+        pause: PauseToken,
     ) -> Self {
         Self {
             session,
@@ -95,6 +98,7 @@ impl HikeRunner {
             end_thre,
             limit_seconds: limit_minutes * 60,
             stop,
+            pause,
             root: None,
             fucked_time: 0,
         }
@@ -105,7 +109,11 @@ impl HikeRunner {
         if let Some(r) = &self.root {
             return Ok(r.clone());
         }
-        emit.emit(CourseEvent::log(format!("正在加载课程 {course_id} …")));
+        emit.emit(CourseEvent::logc(
+            "loading_course",
+            format!("正在加载课程 {course_id} …"),
+            course_id,
+        ));
         let resp = self
             .session
             .hike_query(
@@ -132,9 +140,10 @@ impl HikeRunner {
         });
         let result = self.traverse(course_id, &pseudo_root, emit).await;
         match result {
-            Ok(()) => emit.emit(CourseEvent::Done {
-                msg: format!("课程 {course_id} 已完成"),
-            }),
+            Ok(()) => emit.emit(CourseEvent::done(
+                "course_finished",
+                format!("课程 {course_id} 已完成"),
+            )),
             Err(ZhsError::Stopped) => return Err(ZhsError::Stopped),
             Err(ZhsError::Captcha) => {
                 emit.emit(CourseEvent::CaptchaRequired);
@@ -179,11 +188,13 @@ impl HikeRunner {
             if file_id.is_empty() {
                 return Ok(());
             }
+            // 全局暂停：等恢复后再处理下一个资源
+            self.pause.wait_resume().await;
             // 已看完则跳过
             if study_time >= total_time * self.end_thre && total_time > 0.0 {
                 emit.emit(CourseEvent::Skipped {
                     name: name.clone(),
-                    reason: "已看完".into(),
+                    reason: "watched".into(),
                 });
                 return Ok(());
             }
@@ -208,7 +219,7 @@ impl HikeRunner {
                 None => {
                     emit.emit(CourseEvent::Skipped {
                         name: name.clone(),
-                        reason: "可能是测验，不支持自动完成".into(),
+                        reason: "quiz".into(),
                     });
                 }
                 Some(_) => {
@@ -220,7 +231,7 @@ impl HikeRunner {
                     }
                     emit.emit(CourseEvent::Skipped {
                         name: name.clone(),
-                        reason: "非视频资源，已访问".into(),
+                        reason: "resource".into(),
                     });
                 }
             }
@@ -237,6 +248,8 @@ impl HikeRunner {
         prev_progress: f64,
         emit: &Emitter,
     ) -> Result<()> {
+        // 全局暂停：等恢复后再进入下一个资源
+        self.pause.wait_resume().await;
         if self.limit_seconds > 0 && self.fucked_time >= self.limit_seconds {
             return Err(ZhsError::TimeLimit);
         }
@@ -266,6 +279,17 @@ impl HikeRunner {
         while played_time <= end_time {
             if sleep_or_stop(1.0, &self.stop).await {
                 return Err(ZhsError::Stopped);
+            }
+            // 全局暂停（用户操作）：冻结进度，不上报、不计入时限
+            if self.pause.is_paused() {
+                emit.emit(CourseEvent::VideoProgress {
+                    video_id: file_id.to_string(),
+                    played: played_time,
+                    total: end_time,
+                    paused: true,
+                    quiz: false,
+                });
+                continue;
             }
             self.fucked_time += 1;
             if self.limit_seconds > 0 && self.fucked_time >= self.limit_seconds {

@@ -137,10 +137,10 @@ pub async fn qr_login_poll(
 }
 
 #[tauri::command]
-pub fn logout(state: State<'_, AppState>) {
+pub fn logout(app: AppHandle, state: State<'_, AppState>) {
     state.session.logout();
     let _ = std::fs::remove_file(state.cookies_path());
-    state.engine.stop_all();
+    state.engine.stop_all(&app);
 }
 
 #[tauri::command]
@@ -194,6 +194,7 @@ pub async fn get_courses(
     }))
 }
 
+/// 课程入队（串行刷课：按传入顺序一门一门刷）。返回入队失败的 ID（重复）。
 #[tauri::command]
 pub fn start_courses(
     app: AppHandle,
@@ -204,30 +205,49 @@ pub fn start_courses(
         return Err(err_to_string(ZhsError::NotLoggedIn));
     }
     let cfg = state.task_config();
-    let mut started = Vec::new();
-    let mut failed = Vec::new();
-    for c in courses {
-        match state.engine.start(app.clone(), state.session.clone(), c.id.clone(), c.name.clone(), cfg.clone()) {
-            Ok(()) => started.push(c.id),
-            Err(_) => failed.push(c.id),
-        }
-    }
-    Ok(failed)
+    let courses: Vec<(String, String)> = courses
+        .into_iter()
+        .map(|c| (c.id, c.name))
+        .collect();
+    Ok(state
+        .engine
+        .enqueue(app, state.session.clone(), courses, cfg))
 }
 
+/// 停止指定课程：正在刷的 -> 跳到下一门；排队中的 -> 移出队列。
 #[tauri::command]
-pub fn stop_course(state: State<'_, AppState>, course_id: String) -> bool {
-    state.engine.stop(&course_id)
+pub fn stop_course(app: AppHandle, state: State<'_, AppState>, course_id: String) -> bool {
+    state.engine.stop(&app, &course_id)
 }
 
+/// 停止全部：清空队列 + 停止当前课程。
 #[tauri::command]
-pub fn stop_all_courses(state: State<'_, AppState>) {
-    state.engine.stop_all()
+pub fn stop_all_courses(app: AppHandle, state: State<'_, AppState>) {
+    state.engine.stop_all(&app)
 }
 
+/// 正在刷的课程 ID。
 #[tauri::command]
 pub fn get_running(state: State<'_, AppState>) -> Vec<String> {
     state.engine.running_ids()
+}
+
+/// 队列状态：当前课程 + 排队课程 + 是否暂停。
+#[tauri::command]
+pub fn get_queue_state(state: State<'_, AppState>) -> crate::core::engine::QueueState {
+    state.engine.queue_state()
+}
+
+/// 暂停/继续刷课（当前视频冻结进度，队列不开下一门）。
+#[tauri::command]
+pub fn set_queue_paused(app: AppHandle, state: State<'_, AppState>, paused: bool) {
+    state.engine.set_paused(&app, paused)
+}
+
+/// 清空排队中的课程（不影响正在刷的）。
+#[tauri::command]
+pub fn clear_queue(app: AppHandle, state: State<'_, AppState>) {
+    state.engine.clear_queue(&app)
 }
 
 // ---------------- 配置 ----------------

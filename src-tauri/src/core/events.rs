@@ -1,4 +1,4 @@
-//! 刷课过程中的事件通知与停止控制。
+//! 刷课过程中的事件通知与停止/暂停控制。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,11 +7,20 @@ use serde::Serialize;
 use tokio::sync::watch;
 
 /// 刷课进度事件（发送给前端渲染）。
+///
+/// 带 `code` 的事件，前端按 code 做多语言渲染；`msg` 仅作兜底展示。
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CourseEvent {
-    /// 普通日志
-    Log { level: String, msg: String },
+    /// 普通日志。code 非空时前端可翻译（arg 为课程名等参数）。
+    Log {
+        level: String,
+        msg: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arg: Option<String>,
+    },
     /// 进入章节
     Chapter { name: String },
     /// 进入小节
@@ -35,10 +44,14 @@ pub enum CourseEvent {
     VideoDone { video_id: String, name: String },
     /// 已自动回答弹题
     QuizAnswered { video_id: String, question: String },
-    /// 跳过某项（已看完/不支持类型等）
+    /// 跳过某项。reason 为机器可读代码：watched / quiz / resource
     Skipped { name: String, reason: String },
-    /// 整门课程完成
-    Done { msg: String },
+    /// 整门课程完成。code：course_finished / finished / stopped / captcha
+    Done {
+        msg: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+    },
     /// 达到单课时限
     LimitReached,
     /// 需要验证码
@@ -52,6 +65,25 @@ impl CourseEvent {
         Self::Log {
             level: "info".into(),
             msg: msg.into(),
+            code: None,
+            arg: None,
+        }
+    }
+
+    /// 带翻译代码的日志（arg 通常为课程名）。
+    pub fn logc(code: &str, msg: impl Into<String>, arg: impl Into<String>) -> Self {
+        Self::Log {
+            level: "info".into(),
+            msg: msg.into(),
+            code: Some(code.into()),
+            arg: Some(arg.into()),
+        }
+    }
+
+    pub fn done(code: &str, msg: impl Into<String>) -> Self {
+        Self::Done {
+            msg: msg.into(),
+            code: Some(code.into()),
         }
     }
 }
@@ -122,6 +154,62 @@ impl StopHandle {
 impl Default for StopHandle {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 全局暂停开关：引擎侧调用 `set()`，任务侧持有 `token()`。
+/// 暂停时视频循环不推进进度（不上报、不计入时限），调度器不开下一门课。
+#[derive(Clone)]
+pub struct PauseFlag {
+    tx: Arc<watch::Sender<bool>>,
+}
+
+impl PauseFlag {
+    pub fn new() -> Self {
+        let (tx, _) = watch::channel(false);
+        Self { tx: Arc::new(tx) }
+    }
+
+    pub fn set(&self, paused: bool) {
+        let _ = self.tx.send(paused);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        *self.tx.borrow()
+    }
+
+    pub fn token(&self) -> PauseToken {
+        PauseToken {
+            rx: Arc::new(self.tx.subscribe()),
+        }
+    }
+}
+
+impl Default for PauseFlag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 暂停令牌（任务/调度器侧持有）。
+#[derive(Clone)]
+pub struct PauseToken {
+    rx: Arc<watch::Receiver<bool>>,
+}
+
+impl PauseToken {
+    pub fn is_paused(&self) -> bool {
+        *self.rx.borrow()
+    }
+
+    /// 阻塞直到恢复（未暂停时立即返回）。
+    pub async fn wait_resume(&self) {
+        let mut rx = (*self.rx).clone();
+        while *rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                return; // 发送端已丢弃，视为恢复
+            }
+        }
     }
 }
 

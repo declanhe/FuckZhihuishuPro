@@ -9,15 +9,15 @@
 
       <nav class="side-nav">
         <button
-          v-for="t in tabs"
-          :key="t.key"
-          :class="{ active: tab === t.key }"
-          @click="tab = t.key"
+          v-for="tb in tabs"
+          :key="tb.key"
+          :class="{ active: tab === tb.key }"
+          @click="tab = tb.key"
         >
-          <span class="nav-icon">{{ t.icon }}</span>
-          {{ t.label }}
+          <span class="nav-icon">{{ tb.icon }}</span>
+          {{ t(tb.labelKey) }}
           <span
-            v-if="t.key === 'run' && runningCount > 0"
+            v-if="tb.key === 'run' && runningCount > 0"
             class="badge"
             >{{ runningCount }}</span
           >
@@ -25,10 +25,9 @@
       </nav>
 
       <div class="sidebar-footer">
-        <button class="side-action" @click="stopAll" v-if="runningCount > 0">
-          ⏹ 停止全部 ({{ runningCount }})
+        <button class="side-action logout" @click="doLogout">
+          {{ t("side.logout") }}
         </button>
-        <button class="side-action logout" @click="doLogout">↩ 退出登录</button>
       </div>
     </aside>
 
@@ -37,127 +36,200 @@
     <section v-if="tab === 'courses'" class="page">
       <div class="toolbar">
         <button class="btn-ghost" @click="loadCourses" :disabled="loadingCourses">
-          {{ loadingCourses ? "加载中…" : "刷新课程列表" }}
+          {{ loadingCourses ? t("btn.refreshing") : t("btn.refresh") }}
         </button>
-        <label class="pick-all">
-          <input type="checkbox" :checked="allPicked" @change="toggleAll" />
-          全选
-        </label>
         <button
-          class="btn-primary"
+          class="btn-primary start-btn"
           @click="startPicked"
           :disabled="pickedIds.size === 0"
         >
-          开始刷课（{{ pickedIds.size }} 门）
+          {{ t("btn.start", pickedIds.size) }}
         </button>
       </div>
 
       <p v-if="coursesError" class="error-tip">{{ coursesError }}</p>
+      <p v-else-if="courseList.length" class="drag-tip">{{ t("dragTip") }}</p>
 
-      <div class="course-group" v-if="courses.zhidao.length">
-        <h3>共享学分课（知到）</h3>
-        <div
-          v-for="c in courses.zhidao"
-          :key="c.id"
-          class="course-item card"
-          :class="{ running: runningIds.has(c.id) }"
-        >
-          <label>
-            <input
-              type="checkbox"
-              :checked="pickedIds.has(c.id)"
-              @change="togglePick(c.id)"
-            />
-            <span class="course-name">{{ c.name }}</span>
-          </label>
-          <span class="course-tag" v-if="runningIds.has(c.id)">刷课中</span>
+      <div ref="courseListBox" class="course-list">
+        <template v-for="(c, i) in courseList" :key="c.id">
+          <!-- 拖拽中：原位置显示占位框 -->
+          <div
+            v-if="dragId === c.id"
+            class="drag-placeholder"
+            :style="{ height: dragH + 'px' }"
+          ></div>
+          <div
+            v-else
+            class="course-item card"
+            :class="{
+              running: isCurrent(c.id),
+              'is-queued': isQueued(c.id),
+            }"
+          >
+            <label>
+              <span class="course-no">{{ i + 1 }}</span>
+              <input
+                type="checkbox"
+                :checked="pickedIds.has(c.id)"
+                @change="togglePick(c.id)"
+              />
+              <span class="dot" :class="c.type === 'zhidao' ? 'dot-share' : 'dot-school'"></span>
+              <span class="course-name" :title="c.name">{{ c.name }}</span>
+              <span class="type-label">{{ typeLabel(c.type) }}</span>
+            </label>
+            <div class="course-right">
+              <span class="course-tag" v-if="isCurrent(c.id)">{{ t("tag.running") }}</span>
+              <span class="course-tag done-tag" v-else-if="isDone(c.id)">{{ t("tag.done") }}</span>
+              <span class="course-tag queued-tag" v-else-if="isQueued(c.id)">{{ t("tag.queued") }}</span>
+              <span
+                class="drag-handle"
+                :title="t('dragTip')"
+                @mousedown.prevent="onHandleDown(c.id, $event)"
+                >⠿</span
+              >
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- 拖拽时跟随鼠标的"幽灵"卡片：拿起放大、松手缩回并吸附到落点 -->
+      <div
+        v-if="dragId && dragCourse"
+        class="drag-ghost card course-item"
+        :class="{ dropping: dragDropping }"
+        :style="ghostStyle"
+      >
+        <label>
+          <span class="course-no">{{ dragIndex + 1 }}</span>
+          <span class="dot" :class="dragCourse.type === 'zhidao' ? 'dot-share' : 'dot-school'"></span>
+          <span class="course-name">{{ dragCourse.name }}</span>
+          <span class="type-label">{{ typeLabel(dragCourse.type) }}</span>
+        </label>
+        <div class="course-right">
+          <span class="drag-handle">⠿</span>
         </div>
       </div>
 
-      <div class="course-group" v-if="courses.hike.length">
-        <h3>校内学分课</h3>
-        <div
-          v-for="c in courses.hike"
-          :key="c.id"
-          class="course-item card"
-          :class="{ running: runningIds.has(c.id) }"
-        >
-          <label>
-            <input
-              type="checkbox"
-              :checked="pickedIds.has(c.id)"
-              @change="togglePick(c.id)"
-            />
-            <span class="course-name">{{ c.name }}</span>
-          </label>
-          <span class="course-tag" v-if="runningIds.has(c.id)">刷课中</span>
-        </div>
+      <!-- 全选：列表末尾的最后一个框，复选框与条目对齐 -->
+      <div v-if="courseList.length" class="course-item card pick-all-row">
+        <label>
+          <span class="course-no"></span>
+          <input type="checkbox" :checked="allPicked" @change="toggleAll" />
+          <span class="pick-all-text">{{ t("pickAll") }}</span>
+        </label>
       </div>
 
-      <div v-if="!loadingCourses && courses.zhidao.length === 0 && courses.hike.length === 0" class="empty">
-        <p>没有查到课程 😢</p>
-        <p class="sub">可能原因：账号下没有课程 / 登录已失效 / 网络异常，可点上方按钮刷新。</p>
+      <div v-if="!loadingCourses && courseList.length === 0" class="empty">
+        <p>{{ t("empty.courses.title") }}</p>
+        <p class="sub">{{ t("empty.courses.sub") }}</p>
       </div>
     </section>
 
     <!-- 运行状态 -->
     <section v-else-if="tab === 'run'" class="page">
-      <div v-if="runs.size === 0" class="empty">
-        <p>还没有任务在跑</p>
-        <p class="sub">去「我的课程」勾选课程，点「开始刷课」即可。关掉窗口也会在后台继续刷。</p>
+      <div class="run-toolbar" v-if="runRows.length > 0">
+        <button class="btn-ghost" v-if="runningCount > 0" @click="togglePause">
+          {{ queueState.paused ? t("btn.resume") : t("btn.pause") }}
+        </button>
+        <button class="btn-ghost clear-all" @click="clearAll">
+          {{ t("btn.clearAll") }}
+        </button>
+        <span v-if="queueState.paused && runningCount > 0" class="paused-tip">{{ t("run.pausedTip") }}</span>
       </div>
 
-      <div v-for="r in runList" :key="r.id" class="run-card card">
-        <div class="run-head">
-          <b>{{ r.name }}</b>
-          <button class="btn-danger" @click="stopOne(r.id)" v-if="!r.done">
-            停止
-          </button>
-          <span class="course-tag done-tag" v-else>{{ r.doneTag || "已完成" }}</span>
-        </div>
+      <p v-if="captchaNotice" class="queue-notice">{{ t("notice.captchaCleared") }}</p>
 
-        <div v-if="r.captcha" class="captcha-box">
-          <b>⚠️ 账号被智慧树临时限制，刷课已暂停（不是软件坏了）</b>
-          <p>连续刷课被服务器怀疑了，人工验证一次就能恢复：</p>
-          <p class="captcha-steps">
-            ① 先等 30~60 分钟，期间别反复重试（越试限制越严）<br />
-            ② 用浏览器登录智慧树网页版，手动播放任意视频 1~2 分钟<br />
-            ③ 回到这里，点左侧底部「退出登录」→ 重新扫码登录<br />
-            ④ 先只挂一门课，等它跑完再挂下一门
-          </p>
-          <button class="btn-ghost" @click="restartRun(r)">
-            我已完成验证，重新开始刷课
-          </button>
-        </div>
-
-        <div class="run-now" v-if="!r.done">
-          <template v-if="r.video">
-            <div class="video-line">
-              <span class="video-name" :title="r.video.name">
-                {{ r.chapter ? r.chapter + " / " : "" }}{{ r.lesson ? r.lesson + " / " : "" }}{{ r.video.name }}
-              </span>
-              <span class="video-state" v-if="r.video.quiz">答题中…</span>
-              <span class="video-state" v-else-if="r.video.paused">模拟暂停</span>
-            </div>
-            <div class="progress">
-              <div
-                class="progress-fill"
-                :style="{ width: progressPct(r.video) + '%' }"
-              ></div>
-            </div>
-            <div class="progress-text">
-              {{ fmtTime(r.video.played) }} / {{ fmtTime(r.video.total) }}（{{ progressPct(r.video).toFixed(1) }}%）
-            </div>
-          </template>
-          <p v-else class="run-log-main">{{ r.chapter || "准备中…" }}</p>
-        </div>
-
-        <div class="run-logs" ref="logBoxes">
-          <p v-for="(l, i) in r.logs.slice(-80)" :key="i" :class="'log-' + l.level">
-            {{ l.msg }}
-          </p>
-        </div>
+      <div v-if="runRows.length === 0" class="empty">
+        <p>{{ t("run.empty.title") }}</p>
+        <p class="sub">{{ t("run.empty.sub") }}</p>
       </div>
+
+      <template v-for="(row, i) in runRows" :key="rowKey(row)">
+        <h3 v-if="sectionTitle(row, i)" class="section-title">
+          {{
+            sectionTitle(row, i) === "run.section.queue"
+              ? t("run.section.queue", queueState.pending.length)
+              : t(sectionTitle(row, i)!)
+          }}
+        </h3>
+
+        <!-- 排队中的课程 -->
+        <div v-if="row.rowType === 'queued'" class="queue-item card">
+          <span class="queue-no">{{ row.pos }}</span>
+          <span class="queue-name" :title="row.course.name">{{ row.course.name }}</span>
+          <button class="btn-ghost sm" @click="removeQueued(row.course.id)">
+            {{ t("btn.remove") }}
+          </button>
+        </div>
+
+        <!-- 正在刷 / 已结束共用卡片 -->
+        <div
+          v-else
+          class="run-card card"
+          :class="row.run.done ? 'is-done' : 'is-current'"
+        >
+          <div class="run-head">
+            <b>{{ row.run.name }}</b>
+            <button
+              v-if="!row.run.done"
+              class="btn-danger"
+              @click="skipCurrent(row.run.id)"
+            >
+              {{ t("btn.skip") }}
+            </button>
+            <span class="course-tag done-tag" v-else-if="row.run.doneTag">{{
+              t(row.run.doneTag)
+            }}</span>
+          </div>
+
+          <div v-if="row.run.captcha" class="captcha-box">
+            <b>{{ t("captcha.title") }}</b>
+            <p>{{ t("captcha.intro") }}</p>
+            <p class="captcha-steps">
+              {{ t("captcha.s1") }}<br />
+              {{ t("captcha.s2") }}<br />
+              {{ t("captcha.s3") }}<br />
+              {{ t("captcha.s4") }}
+            </p>
+            <button class="btn-ghost" @click="restartRun(row.run)">
+              {{ t("captcha.retry") }}
+            </button>
+          </div>
+
+          <div class="run-now" v-if="!row.run.done">
+            <template v-if="row.run.video">
+              <div class="video-line">
+                <span class="video-name" :title="row.run.video.name">
+                  {{ row.run.chapter ? row.run.chapter + " / " : "" }}{{ row.run.lesson ? row.run.lesson + " / " : "" }}{{ row.run.video.name }}
+                </span>
+                <span class="video-state" v-if="queueState.paused">{{ t("state.paused") }}</span>
+                <span class="video-state" v-else-if="row.run.video.quiz">{{ t("state.quiz") }}</span>
+                <span class="video-state" v-else-if="row.run.video.paused">{{ t("state.simPause") }}</span>
+              </div>
+              <div class="progress">
+                <div
+                  class="progress-fill"
+                  :style="{ width: progressPct(row.run.video) + '%' }"
+                ></div>
+              </div>
+              <div class="progress-text">
+                {{ fmtTime(row.run.video.played) }} / {{ fmtTime(row.run.video.total) }} ({{ progressPct(row.run.video).toFixed(1) }}%)
+              </div>
+            </template>
+            <p v-else class="run-log-main">{{ row.run.chapter || t("run.preparing") }}</p>
+          </div>
+
+          <div class="run-logs">
+            <p
+              v-for="(l, li) in row.run.logs.slice(-80)"
+              :key="li"
+              :class="'log-' + l.level"
+            >
+              {{ l.msg }}
+            </p>
+          </div>
+        </div>
+      </template>
     </section>
 
     <!-- 设置 -->
@@ -165,21 +237,24 @@
       <div class="settings-grid">
         <div class="setting-item card">
           <label>
-            播放倍速
+            {{ t("set.speed") }}
             <select v-model.number="cfg.speed">
-              <option :value="0">平台最高（推荐，共享课 1.5x / 校内课 1.25x）</option>
+              <option :value="0">{{ t("set.speedAuto") }}</option>
               <option :value="1">1.0x</option>
               <option :value="1.25">1.25x</option>
               <option :value="1.5">1.5x</option>
-              <option :value="1.8">1.8x（最高）</option>
+              <option :value="1.8">1.8x</option>
+              <option :value="2">2.0x</option>
+              <option :value="2.5">{{ t("set.speed25") }}</option>
+              <option :value="3">{{ t("set.speed30") }}</option>
             </select>
           </label>
-          <p class="setting-tip">默认就是最稳的选择；倍速越高刷得越快，被智慧树盯上的概率也越大。</p>
+          <p class="setting-tip">{{ t("set.speedTip") }}</p>
         </div>
 
         <div class="setting-item card">
           <label>
-            完成阈值：{{ Math.round(cfg.end_threshold * 100) }}%
+            {{ t("set.threshold", Math.round(cfg.end_threshold * 100)) }}
             <input
               type="range"
               min="0.85"
@@ -188,28 +263,34 @@
               v-model.number="cfg.end_threshold"
             />
           </label>
-          <p class="setting-tip">
-            播放进度达到该百分比即视为学完，默认 100% 刷满整个视频。
-          </p>
+          <p class="setting-tip">{{ t("set.thresholdTip") }}</p>
         </div>
 
         <div class="setting-item card">
           <label>
-            单门课程时限（分钟，0 = 不限）
+            {{ t("set.limit") }}
             <input type="text" v-model.number="cfg.limit_minutes" />
           </label>
-          <p class="setting-tip">
-            建议参考课程学习习惯中的建议学习时长。
-          </p>
+          <p class="setting-tip">{{ t("set.limitTip") }}</p>
+        </div>
+
+        <div class="setting-item card">
+          <label>
+            {{ t("set.lang") }}
+            <select :value="lang" @change="onLangChange">
+              <option v-for="l in langs" :key="l.value" :value="l.value">
+                {{ l.label }}
+              </option>
+            </select>
+          </label>
+          <p class="setting-tip">{{ t("set.langTip") }}</p>
         </div>
 
         <div class="setting-item card">
           <div class="toggle-row">
             <div>
-              <b>最小化到托盘</b>
-              <p class="setting-tip">
-                关闭窗口时最小化到托盘，后台继续刷课（推荐开启）。托盘右键可退出。
-              </p>
+              <b>{{ t("set.tray") }}</b>
+              <p class="setting-tip">{{ t("set.trayTip") }}</p>
             </div>
             <button
               class="toggle"
@@ -226,8 +307,8 @@
         <div class="setting-item card">
           <div class="toggle-row">
             <div>
-              <b>黑暗模式</b>
-              <p class="setting-tip">深色界面，夜间刷课更护眼，立即生效。</p>
+              <b>{{ t("set.dark") }}</b>
+              <p class="setting-tip">{{ t("set.darkTip") }}</p>
             </div>
             <button
               class="toggle"
@@ -241,60 +322,194 @@
           </div>
         </div>
       </div>
-
-      <button class="btn-primary save-btn" @click="saveCfg">保存设置</button>
-      <p class="save-ok" v-if="saveOk">✓ 已保存</p>
     </section>
     </main>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, reactive } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, reactive, watch } from "vue";
 import {
   api,
   onCourseEvent,
+  onQueueState,
+  parseErr,
   type AppConfig,
   type CourseItem,
+  type QueueState,
 } from "../api";
+import { uiAlert, uiConfirm } from "../dialog";
+import { t, lang, setLang, langs, type Lang } from "../i18n";
 
 const emit = defineEmits<{ logout: [] }>();
 
 const tabs = [
-  { key: "courses", label: "我的课程", icon: "📚" },
-  { key: "run", label: "刷课进度", icon: "⚡" },
-  { key: "settings", label: "设置", icon: "⚙" },
+  { key: "courses", labelKey: "nav.courses", icon: "📚" },
+  { key: "run", labelKey: "nav.run", icon: "⚡" },
+  { key: "settings", labelKey: "nav.settings", icon: "⚙️" },
 ] as const;
 
 const tab = ref<"courses" | "run" | "settings">("courses");
 
-// ---------- 课程列表 ----------
-const courses = reactive<{ zhidao: CourseItem[]; hike: CourseItem[] }>({
-  zhidao: [],
-  hike: [],
-});
+// ---------- 课程列表（合并为一个可拖拽排序的列表） ----------
+interface CourseRow {
+  name: string;
+  id: string;
+  type: "zhidao" | "hike";
+}
+
+const courseList = ref<CourseRow[]>([]);
 const loadingCourses = ref(false);
 const coursesError = ref("");
 const pickedIds = ref(new Set<string>());
-const runningIds = ref(new Set<string>());
 
-const allPicked = computed(() => {
-  const all = [...courses.zhidao, ...courses.hike];
-  return all.length > 0 && all.every((c) => pickedIds.value.has(c.id));
-});
+const ORDER_KEY = "fzhs-course-order";
+
+function typeLabel(type: "zhidao" | "hike"): string {
+  return type === "zhidao" ? t("type.share") : t("type.school");
+}
+
+/** 按保存的顺序排列课程（新课程追加在末尾） */
+function applyOrder(rows: CourseRow[]): CourseRow[] {
+  let saved: string[] = [];
+  try {
+    saved = JSON.parse(localStorage.getItem(ORDER_KEY) || "[]");
+  } catch {
+    /* ignore */
+  }
+  const idx = new Map(saved.map((id, i) => [id, i]));
+  return [...rows].sort(
+    (a, b) =>
+      (idx.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
+      (idx.get(b.id) ?? Number.MAX_SAFE_INTEGER)
+  );
+}
+
+function persistOrder() {
+  localStorage.setItem(
+    ORDER_KEY,
+    JSON.stringify(courseList.value.map((c) => c.id))
+  );
+}
 
 async function loadCourses() {
   loadingCourses.value = true;
   coursesError.value = "";
   try {
     const r = await api.getCourses();
-    courses.zhidao = r.zhidao;
-    courses.hike = r.hike;
+    const rows: CourseRow[] = [
+      ...r.zhidao.map((c) => ({ ...c, type: "zhidao" as const })),
+      ...r.hike.map((c) => ({ ...c, type: "hike" as const })),
+    ];
+    courseList.value = applyOrder(rows);
   } catch (e) {
-    coursesError.value = "课程加载失败：" + String(e);
+    coursesError.value = t("err.loadCourses", parseErr(e).message);
   } finally {
     loadingCourses.value = false;
   }
+}
+
+const allPicked = computed(
+  () =>
+    courseList.value.length > 0 &&
+    courseList.value.every((c) => pickedIds.value.has(c.id))
+);
+
+// ---------- 拖拽排序（手柄 + 指针事件；HTML5 DnD 在 WebView2 里拖不动） ----------
+// 拿起后卡片变"幽灵"跟随鼠标（放大动效），原位置显示占位框，松手缩回吸附到落点。
+const courseListBox = ref<HTMLElement | null>(null);
+const dragId = ref<string | null>(null);
+const dragIndex = ref(0);
+const dragH = ref(48);
+const dragDropping = ref(false);
+const ghostStyle = ref<Record<string, string>>({});
+let dragStartY = 0;
+let dragOrigTop = 0;
+let dragListTop = 0;
+let dragSlotH = 1;
+let dragMoved = false;
+let dropTimer: number | null = null;
+
+const dragCourse = computed(
+  () => courseList.value.find((c) => c.id === dragId.value) || null
+);
+
+function onHandleDown(id: string, e: MouseEvent) {
+  if (dropTimer) {
+    clearTimeout(dropTimer);
+    dropTimer = null;
+  }
+  const list = courseList.value;
+  const from = list.findIndex((c) => c.id === id);
+  const box = courseListBox.value;
+  if (from < 0 || !box || list.length < 2) return;
+  const items = Array.from(box.querySelectorAll(".course-item")) as HTMLElement[];
+  if (items.length < 2) return;
+  const r0 = items[0].getBoundingClientRect();
+  const r1 = items[1].getBoundingClientRect();
+  const self = items[from].getBoundingClientRect();
+  dragListTop = r0.top;
+  dragSlotH = r1.top - r0.top;
+  dragH.value = Math.round(r0.height);
+  dragStartY = e.clientY;
+  dragOrigTop = self.top;
+  dragMoved = false;
+  dragDropping.value = false;
+  dragIndex.value = from;
+  ghostStyle.value = {
+    left: self.left + "px",
+    top: self.top + "px",
+    width: self.width + "px",
+  };
+  dragId.value = id;
+  window.addEventListener("mousemove", onDragMove);
+  window.addEventListener("mouseup", onDragFinish);
+  window.addEventListener("blur", onDragFinish);
+}
+
+function onDragMove(e: MouseEvent) {
+  if (!dragId.value || dragDropping.value) return;
+  if (!(e.buttons & 1)) {
+    onDragFinish();
+    return;
+  }
+  // 幽灵卡片跟手（垂直方向）
+  ghostStyle.value = {
+    ...ghostStyle.value,
+    top: dragOrigTop + (e.clientY - dragStartY) + "px",
+  };
+  // 光标进入哪个槽位就换到哪个位置
+  const len = courseList.value.length;
+  const idx = Math.min(
+    len - 1,
+    Math.max(0, Math.floor((e.clientY - dragListTop) / dragSlotH))
+  );
+  if (idx === dragIndex.value) return;
+  const from = courseList.value.findIndex((c) => c.id === dragId.value);
+  if (from < 0) return;
+  const [moved] = courseList.value.splice(from, 1);
+  courseList.value.splice(idx, 0, moved);
+  dragIndex.value = idx;
+  dragMoved = true;
+}
+
+function onDragFinish() {
+  if (!dragId.value) return;
+  window.removeEventListener("mousemove", onDragMove);
+  window.removeEventListener("mouseup", onDragFinish);
+  window.removeEventListener("blur", onDragFinish);
+  if (dragMoved) persistOrder();
+  // 缩回原大小并吸附到落点槽位，然后移除幽灵、显示真实卡片
+  dragDropping.value = true;
+  ghostStyle.value = {
+    ...ghostStyle.value,
+    top: dragListTop + dragIndex.value * dragSlotH + "px",
+  };
+  dropTimer = window.setTimeout(() => {
+    dragId.value = null;
+    dragDropping.value = false;
+    dropTimer = null;
+  }, 170);
 }
 
 function togglePick(id: string) {
@@ -307,29 +522,88 @@ function togglePick(id: string) {
 function toggleAll() {
   const s = new Set<string>();
   if (!allPicked.value) {
-    for (const c of [...courses.zhidao, ...courses.hike]) s.add(c.id);
+    for (const c of courseList.value) s.add(c.id);
   }
   pickedIds.value = s;
 }
 
+/** 停止全部任务并把刷课界面还原为初始状态（开始刷课 / 清空全部共用） */
+async function resetRunView() {
+  for (const id of runs.keys()) clearedIds.value.add(id);
+  for (const q of queueState.pending) clearedIds.value.add(q.id);
+  await api.stopAll();
+  runs.clear();
+  skippedIds.value.clear();
+  captchaNotice.value = false;
+  // queue-state 事件会同步清空 pending/current/paused
+}
+
 async function startPicked() {
-  const picked = [...courses.zhidao, ...courses.hike].filter((c) =>
-    pickedIds.value.has(c.id)
-  );
+  const picked = courseList.value.filter((c) => pickedIds.value.has(c.id));
+  if (picked.length === 0) return;
   try {
-    const failed = await api.startCourses(picked);
+    // 每次开始刷课：清空上一轮的列表，从新选择重新开始
+    await resetRunView();
+    const failed = await api.startCourses(picked as CourseItem[]);
     for (const c of picked) {
-      runningIds.value.add(c.id);
-      ensureRun(c.id, c.name);
+      clearedIds.value.delete(c.id);
+      doneIds.value.delete(c.id); // 重新开刷，摘掉"已完成"直到再次刷完
     }
-    pickedIds.value = new Set();
+    persistDone();
     tab.value = "run";
+    pickedIds.value = new Set();
     if (failed.length > 0) {
-      alert(failed.length + " 门课程启动失败（可能已在刷课中）");
+      await uiAlert(t("err.startDup", failed.length));
     }
   } catch (e) {
-    alert("启动失败：" + String(e));
+    await uiAlert(t("err.start", parseErr(e).message));
   }
+}
+
+// ---------- 队列状态 ----------
+const queueState = reactive<{
+  current: { id: string; name: string } | null;
+  pending: { id: string; name: string }[];
+  paused: boolean;
+}>({ current: null, pending: [], paused: false });
+
+const captchaNotice = ref(false);
+
+function applyQueueState(s: QueueState) {
+  queueState.current = s.current;
+  queueState.pending = s.pending;
+  queueState.paused = s.paused;
+  if (s.notice === "captcha_cleared") captchaNotice.value = true;
+  if (s.current) ensureRun(s.current.id, s.current.name);
+}
+
+function isCurrent(id: string) {
+  return queueState.current?.id === id;
+}
+
+function isQueued(id: string) {
+  return queueState.pending.some((c) => c.id === id);
+}
+
+/** 已刷完（课程列表页显示"已完成"标记，清空进度/重启后仍保留） */
+function isDone(id: string) {
+  return doneIds.value.has(id);
+}
+
+async function togglePause() {
+  await api.setQueuePaused(!queueState.paused);
+}
+
+/** 清空全部：还在刷（进行中或排队）时先确认；已经停了就直接清 */
+async function clearAll() {
+  if (runningCount.value > 0 && !(await uiConfirm(t("confirm.clearAll"), { danger: true }))) {
+    return;
+  }
+  await resetRunView();
+}
+
+function removeQueued(id: string) {
+  api.stopCourse(id); // 排队中的课程：后端直接移出队列
 }
 
 // ---------- 运行状态 ----------
@@ -349,17 +623,67 @@ interface RunState {
   video: RunVideo | null;
   logs: { level: string; msg: string }[];
   done: boolean;
-  /** 终态标签：已完成 / 已停止 / 待验证 / 已达时限 */
+  /** 终态标签的 i18n key：tag.done / tag.stopped / tag.skipped / tag.captcha / tag.limit / tag.error */
   doneTag: string;
   /** 账号被智慧树临时限制（-12），卡片上展示恢复引导 */
   captcha: boolean;
 }
 
 const runs = reactive(new Map<string, RunState>());
-const runList = computed(() => [...runs.values()]);
+const skippedIds = ref(new Set<string>());
+/** 「清空全部」时记录被清掉的课程：忽略旧任务随后发来的尾巴事件，避免卡片复活 */
+const clearedIds = ref(new Set<string>());
+/** 刷完的课程（持久化）：清空刷课进度/重启后，「我的课程」仍显示"已完成" */
+const DONE_KEY = "fzhs-done-courses";
+const doneIds = ref(new Set<string>(loadDoneIds()));
+
+function loadDoneIds(): string[] {
+  try {
+    return JSON.parse(localStorage.getItem(DONE_KEY) || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function persistDone() {
+  localStorage.setItem(DONE_KEY, JSON.stringify([...doneIds.value]));
+}
+
 const runningCount = computed(
-  () => [...runs.values()].filter((r) => !r.done).length
+  () => [...runs.values()].filter((r) => !r.done).length + queueState.pending.length
 );
+
+type RunRow =
+  | { rowType: "active"; run: RunState }
+  | { rowType: "queued"; course: { id: string; name: string }; pos: number }
+  | { rowType: "done"; run: RunState };
+
+/** 排序：正在刷的置顶 -> 排队中 -> 已刷完的放最后 */
+const runRows = computed<RunRow[]>(() => {
+  const rows: RunRow[] = [];
+  for (const r of runs.values()) {
+    if (!r.done) rows.push({ rowType: "active", run: r });
+  }
+  queueState.pending.forEach((c, i) =>
+    rows.push({ rowType: "queued", course: c, pos: i + 1 })
+  );
+  for (const r of runs.values()) {
+    if (r.done) rows.push({ rowType: "done", run: r });
+  }
+  return rows;
+});
+
+function rowKey(row: RunRow): string {
+  return row.rowType === "queued" ? "q:" + row.course.id : row.run.id;
+}
+
+function sectionTitle(row: RunRow, i: number): string | null {
+  const prev = i > 0 ? runRows.value[i - 1] : null;
+  if (row.rowType === "active") return i === 0 ? "run.section.active" : null;
+  if (row.rowType === "queued")
+    return prev?.rowType === "queued" ? null : "run.section.queue";
+  return prev?.rowType === "done" ? null : "run.section.done";
+}
 
 function ensureRun(id: string, name: string): RunState {
   const existing = runs.get(id);
@@ -391,8 +715,8 @@ function ensureRun(id: string, name: string): RunState {
 }
 
 function pushLog(r: RunState, level: string, msg: string) {
-  const t = new Date().toLocaleTimeString("zh-CN", { hour12: false });
-  r.logs.push({ level, msg: `[${t}] ${msg}` });
+  const time = new Date().toLocaleTimeString([], { hour12: false });
+  r.logs.push({ level, msg: `[${time}] ${msg}` });
   if (r.logs.length > 300) r.logs.splice(0, r.logs.length - 300);
 }
 
@@ -409,18 +733,36 @@ function fmtTime(s: number): string {
   return `${h}:${String(m).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
 }
 
+function skipReasonText(reason?: string): string {
+  if (!reason) return "";
+  if (["watched", "quiz", "resource"].includes(reason)) {
+    return t("reason." + reason);
+  }
+  return reason;
+}
+
 let unlisten: (() => void) | null = null;
+let unlistenQueue: (() => void) | null = null;
 
 onMounted(async () => {
   unlisten = await onCourseEvent(({ courseId, courseName, event }) => {
+    // 「清空全部」后忽略旧任务的尾巴事件（它们到达时 runs 已被清空）
+    if (clearedIds.value.has(courseId)) return;
     const r = ensureRun(courseId, courseName);
     switch (event.kind) {
-      case "log":
-        pushLog(r, event.level || "info", event.msg || "");
+      case "log": {
+        const code = event.code || "";
+        if (code === "task_start") pushLog(r, "info", t("log.taskStart"));
+        else if (code === "loading_course")
+          pushLog(r, "info", t("log.loading", event.arg || ""));
+        else if (code === "start_course")
+          pushLog(r, "info", t("log.startCourse", event.arg || ""));
+        else pushLog(r, event.level || "info", event.msg || "");
         break;
+      }
       case "chapter":
         r.chapter = event.name || "";
-        pushLog(r, "info", `章节：${r.chapter}`);
+        pushLog(r, "info", t("log.chapter", r.chapter));
         break;
       case "lesson":
         r.lesson = event.name || "";
@@ -434,69 +776,99 @@ onMounted(async () => {
           paused: false,
           quiz: false,
         };
-        pushLog(r, "info", `开始观看：${event.name}`);
+        pushLog(r, "info", t("log.videoStart", event.name || ""));
         break;
       case "video_progress":
-        // 后端 VideoProgress 事件只有 video_id 没有 name，必须按 video_id 匹配
+        // 后端 VideoProgress 事件只有 video_id 没有 name，必须按 video_id 匹配；
+        // 应用重启后进度事件先到（video_start 已丢失），用事件数据重建，
+        // 避免当前视频整段停在"准备中"
         if (r.video && r.video.video_id === event.video_id) {
           r.video.played = event.played || 0;
           r.video.total = event.total || 0;
           r.video.paused = !!event.paused;
           r.video.quiz = !!event.quiz;
+        } else if (!r.video && event.video_id) {
+          r.video = {
+            video_id: event.video_id,
+            name: event.name || event.video_id,
+            played: event.played || 0,
+            total: event.total || 0,
+            paused: !!event.paused,
+            quiz: !!event.quiz,
+          };
         }
         break;
       case "video_done":
-        pushLog(r, "info", `看完：${event.name}`);
+        pushLog(r, "info", t("log.videoDone", event.name || ""));
         r.video = null;
         break;
       case "quiz_answered":
-        pushLog(r, "ok", `已自动答题：${event.question || ""}`);
+        pushLog(r, "ok", t("log.quizAnswered", event.question || ""));
         break;
       case "skipped":
-        pushLog(r, "info", `跳过 ${event.name}：${event.reason}`);
+        pushLog(
+          r,
+          "info",
+          t("log.skipped", event.name || "", skipReasonText(event.reason))
+        );
         break;
       case "limit_reached":
-        pushLog(r, "warn", "达到单课程时限，本课程停止");
+        pushLog(r, "warn", t("log.limit"));
         r.done = true;
-        r.doneTag = "已达时限";
-        runningIds.value.delete(courseId);
+        r.doneTag = "tag.limit";
         break;
       case "captcha_required":
         r.done = true;
         r.captcha = true;
-        r.doneTag = "待验证";
-        pushLog(r, "warn", "账号被智慧树临时限制，任务已暂停（见上方提示）");
-        runningIds.value.delete(courseId);
+        r.doneTag = "tag.captcha";
+        pushLog(r, "warn", t("log.captchaHit"));
         break;
-      case "done":
-        pushLog(r, "ok", event.msg || "课程完成");
+      case "done": {
+        const code = event.code || "";
+        let line: string;
+        if (code === "course_finished") line = t("done.courseFinished");
+        else if (code === "finished") line = t("done.finished");
+        else if (code === "stopped") line = t("done.stopped");
+        else if (code === "captcha") line = t("done.captcha");
+        else line = event.msg || "";
+        pushLog(r, code === "error" ? "error" : "ok", line);
         r.done = true;
-        if ((event.msg || "").includes("限制")) {
+        if (code === "captcha" || (!code && (event.msg || "").includes("限制"))) {
           // -12 在任务开头就被拦下时不会发 captcha_required，靠这里兜底展示引导
           r.captcha = true;
-          r.doneTag = "待验证";
-        } else {
-          r.doneTag = (event.msg || "").includes("停止") ? "已停止" : "已完成";
+          r.doneTag = "tag.captcha";
+        } else if (code === "stopped") {
+          r.doneTag = skippedIds.value.has(courseId) ? "tag.skipped" : "tag.stopped";
+        } else if (code === "error") {
+          r.doneTag = "tag.error";
+        } else if (!r.doneTag) {
+          // finished：limit_reached 等已先设好终态标签时保留（那种不算刷完）
+          r.doneTag = "tag.done";
+          doneIds.value.add(courseId);
+          persistDone();
         }
-        runningIds.value.delete(courseId);
+        skippedIds.value.delete(courseId);
         break;
-      case "failed":
+      }
+      case "failed": {
         pushLog(r, "error", event.msg || "");
         // 关键失败（账号被限制）时任务实际已停止，显示终态避免进度条凝固
-        if ((event.msg || "").includes("限制") || (event.msg || "").includes("验证码")) {
+        const msg = event.msg || "";
+        if (msg.includes("限制") || msg.includes("验证码")) {
           r.done = true;
           r.captcha = true;
-          r.doneTag = "待验证";
-          runningIds.value.delete(courseId);
+          r.doneTag = "tag.captcha";
         }
         break;
+      }
     }
   });
 
-  // 恢复运行中的任务列表（页面刷新时）
+  unlistenQueue = await onQueueState(applyQueueState);
+
+  // 恢复队列与运行状态（页面刷新时）
   try {
-    const ids = await api.getRunning();
-    for (const id of ids) runningIds.value.add(id);
+    applyQueueState(await api.getQueueState());
   } catch {
     /* ignore */
   }
@@ -506,50 +878,48 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   if (unlisten) unlisten();
+  if (unlistenQueue) unlistenQueue();
+  onDragFinish();
+  if (dropTimer) {
+    clearTimeout(dropTimer);
+    dropTimer = null;
+  }
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
 });
 
-async function stopOne(id: string) {
-  await api.stopCourse(id);
-  runningIds.value.delete(id);
-  const r = runs.get(id);
-  if (r) {
-    r.done = true;
-    r.doneTag = "已停止";
-    pushLog(r, "warn", "已手动停止");
+async function skipCurrent(id: string) {
+  skippedIds.value.add(id);
+  try {
+    await api.stopCourse(id); // 正在刷的课程：停止后队列自动开始下一门
+  } catch {
+    skippedIds.value.delete(id);
   }
-}
-
-async function stopAll() {
-  await api.stopAll();
-  for (const r of runs.values()) {
-    if (!r.done) {
-      r.done = true;
-      r.doneTag = "已停止";
-      pushLog(r, "warn", "已手动停止");
-    }
-  }
-  runningIds.value.clear();
 }
 
 /** 完成人工验证后，从卡片上直接重新开始这门课 */
 async function restartRun(r: RunState) {
   r.captcha = false;
+  captchaNotice.value = false;
+  clearedIds.value.delete(r.id);
+  doneIds.value.delete(r.id);
+  persistDone();
   try {
     const failed = await api.startCourses([{ id: r.id, name: r.name }]);
     if (failed.length === 0) {
-      runningIds.value.add(r.id);
       ensureRun(r.id, r.name);
     } else {
-      alert("启动失败（该课程可能已在刷课中）");
+      await uiAlert(t("err.startDup", 1));
     }
   } catch (e) {
-    alert("启动失败：" + String(e));
+    await uiAlert(t("err.start", parseErr(e).message));
   }
 }
 
 async function doLogout() {
-  if (runningCount.value > 0 && !confirm("还有任务在刷课，退出登录将全部停止，确定？"))
-    return;
+  if (runningCount.value > 0 && !(await uiConfirm(t("confirm.logout")))) return;
   await api.logout();
   emit("logout");
 }
@@ -561,7 +931,6 @@ const cfg = ref<AppConfig>({
   limit_minutes: 0,
   minimize_to_tray: true,
 });
-const saveOk = ref(false);
 
 // 黑暗模式（UI 偏好存 localStorage，不走后端配置）
 const darkMode = ref(localStorage.getItem("fzhs-dark") === "1");
@@ -571,15 +940,34 @@ function applyDark() {
   localStorage.setItem("fzhs-dark", darkMode.value ? "1" : "0");
 }
 
-async function loadCfg() {
-  cfg.value = await api.getConfig();
+function onLangChange(e: Event) {
+  setLang((e.target as HTMLSelectElement).value as Lang);
 }
 
-async function saveCfg() {
-  await api.saveConfig(cfg.value);
-  saveOk.value = true;
-  setTimeout(() => (saveOk.value = false), 2000);
+async function loadCfg() {
+  cfg.value = await api.getConfig();
+  cfgLoaded = true;
 }
+
+// 设置即改即存（无保存按钮、无提示）：深度监听 + 300ms 防抖
+let cfgLoaded = false;
+let saveTimer: number | null = null;
+watch(
+  cfg,
+  () => {
+    if (!cfgLoaded) return;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = window.setTimeout(async () => {
+      saveTimer = null;
+      try {
+        await api.saveConfig(cfg.value);
+      } catch {
+        /* 保存失败静默，下次修改再试 */
+      }
+    }, 300);
+  },
+  { deep: true }
+);
 </script>
 
 <style scoped>
@@ -660,7 +1048,7 @@ async function saveCfg() {
   padding: 11px 14px;
   background: transparent;
   color: var(--text-sub);
-  font-size: 14.5px;
+  font-size: 16px;
   border-radius: 10px;
   text-align: left;
 }
@@ -676,8 +1064,15 @@ async function saveCfg() {
   font-weight: 600;
 }
 
+/* 图标统一盒子：三行图标同宽对齐，字号一致 */
 .nav-icon {
+  width: 22px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   font-size: 16px;
+  line-height: 1;
 }
 
 .badge {
@@ -738,18 +1133,19 @@ async function saveCfg() {
   gap: 14px;
 }
 
-.pick-all {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 14px;
+.start-btn {
+  margin-left: auto;
+}
+
+/* 全选行：列表末尾的最后一个框；空序号占位使复选框与条目对齐 */
+.pick-all-row label {
   color: var(--text-sub);
 }
 
-.course-group h3 {
-  font-size: 15px;
-  margin: 6px 0 10px;
-  color: var(--text);
+.drag-tip {
+  color: var(--text-sub);
+  font-size: 12.5px;
+  margin: -6px 0 0;
 }
 
 .course-item {
@@ -763,20 +1159,119 @@ async function saveCfg() {
 .course-item label {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   cursor: pointer;
   font-size: 15px;
+  min-width: 0;
+  flex: 1;
 }
 
 .course-item.running {
   opacity: 0.75;
 }
 
+.course-item.is-queued {
+  opacity: 0.85;
+}
+
+.course-item.dragging {
+  opacity: 0.5;
+}
+
+/* 序号（跟随拖拽排序实时变化） */
+.course-no {
+  width: 24px;
+  flex-shrink: 0;
+  text-align: right;
+  color: var(--text-sub);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
 .course-name {
-  max-width: 560px;
+  max-width: 520px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 课程性质：彩色 dot + 小字 */
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dot-share {
+  background: var(--green);
+}
+
+.dot-school {
+  background: #4a90d9;
+}
+
+.type-label {
+  font-size: 11.5px;
+  color: var(--text-sub);
+  background: var(--tab-bg);
+  padding: 1px 8px;
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+/* 拖拽手柄：只有拖住它才能调整顺序 */
+.course-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* 拖拽占位框：原位置留出的空槽 */
+.drag-placeholder {
+  border: 1.5px dashed var(--scroll-thumb);
+  background: var(--tab-bg);
+  border-radius: 10px;
+  margin-bottom: 8px;
+}
+
+/* 拖拽幽灵卡片：跟随鼠标，拿起放大、松手缩回（top 无过渡保证跟手） */
+.drag-ghost {
+  position: fixed;
+  z-index: 100;
+  margin: 0;
+  pointer-events: none;
+  user-select: none;
+  box-shadow: 0 10px 28px var(--card-shadow);
+  transform: scale(1.03);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.drag-ghost.dropping {
+  transform: scale(1);
+  box-shadow: 0 2px 8px var(--card-shadow);
+  transition: transform 0.15s ease, top 0.16s ease, box-shadow 0.15s ease;
+}
+
+.drag-handle {
+  cursor: grab;
+  color: var(--text-sub);
+  font-size: 15px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 6px;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.drag-handle:hover {
+  background: var(--tab-bg);
+  color: var(--text);
+}
+
+.drag-handle:active {
+  cursor: grabbing;
 }
 
 .course-tag {
@@ -785,6 +1280,16 @@ async function saveCfg() {
   font-size: 12px;
   padding: 3px 10px;
   border-radius: 10px;
+  flex-shrink: 0;
+}
+
+.queued-tag {
+  color: #c07f00;
+  background: rgba(240, 173, 40, 0.16);
+}
+
+html.dark .queued-tag {
+  color: #ffc861;
 }
 
 .done-tag {
@@ -809,9 +1314,90 @@ async function saveCfg() {
   margin-top: 8px;
 }
 
-/* 运行卡片 */
+/* ---------- 运行页 ---------- */
+.run-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.clear-all {
+  color: var(--danger);
+}
+
+.paused-tip {
+  color: #c07f00;
+  font-size: 13px;
+}
+
+html.dark .paused-tip {
+  color: #ffc861;
+}
+
+.queue-notice {
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: rgba(240, 173, 40, 0.12);
+  border: 1px solid rgba(240, 173, 40, 0.5);
+  color: #c07f00;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+html.dark .queue-notice {
+  color: #ffc861;
+}
+
+.section-title {
+  font-size: 15px;
+  margin: 4px 0 -2px;
+  color: var(--text);
+}
+
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 18px;
+}
+
+.queue-no {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--tab-bg);
+  color: var(--text-sub);
+  font-size: 12.5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.queue-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14.5px;
+}
+
+.btn-ghost.sm {
+  padding: 5px 12px;
+  font-size: 13px;
+}
+
 .run-card {
   padding: 16px 20px;
+}
+
+.run-card.is-current {
+  border-left: 3px solid var(--green);
+}
+
+.run-card.is-done {
+  opacity: 0.78;
 }
 
 .run-head {
@@ -819,6 +1405,7 @@ async function saveCfg() {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 10px;
+  gap: 10px;
 }
 
 .run-head b {
@@ -863,6 +1450,7 @@ html.dark .captcha-box > b {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 8px;
+  gap: 10px;
 }
 
 .video-name {
@@ -921,12 +1509,18 @@ html.dark .captcha-box > b {
   color: var(--danger);
 }
 
-/* 设置：宽窗口自动双列，卡片统一等高 */
+/* ---------- 设置：最多一行两块，窄窗口单列 ---------- */
 .settings-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   grid-auto-rows: 1fr;
   gap: 14px;
+}
+
+@media (max-width: 720px) {
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .setting-item {
@@ -1006,16 +1600,5 @@ html.dark .captcha-box > b {
   font-size: 12.5px;
   margin-top: 8px;
   line-height: 1.6;
-}
-
-.save-btn {
-  align-self: flex-start;
-  width: auto;
-  margin: 0;
-}
-
-.save-ok {
-  color: var(--green-dark);
-  font-size: 13px;
 }
 </style>

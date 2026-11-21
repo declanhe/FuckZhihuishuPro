@@ -127,8 +127,61 @@ impl ZhsSession {
         self.uuid.lock().unwrap().is_some() && !self.store.export().is_empty()
     }
 
-    /// 发起请求并解析 JSON 响应。
+    /// 发起请求并解析 JSON 响应（带重试，对照 fuckZHS 的 requests Retry）：
+    /// - 连接失败：所有方法都重试（连接没建立，服务器肯定没处理）
+    /// - 5xx 网关错误：GET 多次重试；POST 保守重试 1 次（防重复上报进度）
+    /// - 超时：GET 重试；POST 超时可能已到达服务器，不重试
+    /// - 4xx / 业务错误码 / 验证码：不重试，原样返回
     async fn request(
+        &self,
+        method: Method,
+        url: &str,
+        extra_headers: &[(&str, &str)],
+        query: Option<&[(String, String)]>,
+        form: Option<&[(String, String)]>,
+    ) -> Result<Value> {
+        let is_get = method == Method::GET;
+        let mut attempt = 0u32;
+        loop {
+            let res = self
+                .request_once(method.clone(), url, extra_headers, query, form)
+                .await;
+            match res {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    attempt += 1;
+                    let max_retries = match &e {
+                        ZhsError::Http(h) if h.is_connect() => 3,
+                        ZhsError::Http(h) if h.is_timeout() => {
+                            if is_get {
+                                3
+                            } else {
+                                0
+                            }
+                        }
+                        ZhsError::Http(h)
+                            if h.status().is_some_and(|s| s.as_u16() >= 500) =>
+                        {
+                            if is_get {
+                                3
+                            } else {
+                                1
+                            }
+                        }
+                        _ => 0,
+                    };
+                    if attempt > max_retries {
+                        return Err(e);
+                    }
+                    let backoff = 300u64 << (attempt - 1).min(3);
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                }
+            }
+        }
+    }
+
+    /// 单次请求（不带重试）。
+    async fn request_once(
         &self,
         method: Method,
         url: &str,

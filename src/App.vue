@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { api } from "./api";
+import { t } from "./i18n";
 import Login from "./components/Login.vue";
 import Home from "./components/Home.vue";
+import AppDialog from "./components/AppDialog.vue";
 import "./style.css";
 
 const page = ref<"loading" | "login" | "home">("loading");
-const restoredTip = ref(false);
 
 onMounted(async () => {
   // 恢复黑暗模式偏好
@@ -15,11 +16,10 @@ onMounted(async () => {
   }
   try {
     // 尝试用本地 cookies 恢复登录态（短时间免登录）
-    const restored = await api.restoreLogin();
+    await api.restoreLogin();
     const state = await api.getLoginState();
     if (state.logged_in) {
       page.value = "home";
-      if (restored) restoredTip.value = true;
       return;
     }
   } catch {
@@ -36,7 +36,9 @@ function onLogout() {
 <template>
   <Login v-if="page === 'login'" @done="page = 'home'" />
   <Home v-else-if="page === 'home'" @logout="onLogout" />
-  <div v-else class="boot">正在启动…</div>
+  <div v-else class="boot">{{ t("boot") }}</div>
+  <!-- 应用内弹窗（confirm/alert），全局唯一实例 -->
+  <AppDialog />
 </template>
 
 <style scoped>

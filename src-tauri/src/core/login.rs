@@ -200,18 +200,28 @@ pub async fn qr_poll(session: &ZhsSession, qr_token: &str) -> Result<QrStatus> {
 }
 
 /// 恢复已保存的登录态（cookies.json）。
+/// 恢复后用真实接口验证 cookies 是否仍然有效——避免"看起来已登录，
+/// 开刷才发现全部失败"。网络故障等临时问题不误伤（保持登录态）。
 pub async fn restore_session(session: &ZhsSession, cookies: Value) -> Result<()> {
     session.import_cookies(cookies)?;
     if session.uuid().is_none() {
         return Err(ZhsError::NotLoggedIn);
     }
-    Ok(())
+    match check_alive(session).await {
+        Ok(()) => Ok(()),
+        // 服务器明确返回未登录：清掉登录态，让用户重新扫码
+        Err(ZhsError::NotLoggedIn) => {
+            session.logout();
+            Err(ZhsError::NotLoggedIn)
+        }
+        // 网络抖动/超时等：无法判定，保持登录态，开刷失败再提示
+        Err(_) => Ok(()),
+    }
 }
 
 /// 用当前登录态验证 cookies 是否仍然有效：请求课程列表接口。
-/// 有效返回 true。
-pub async fn check_alive(session: &ZhsSession) -> bool {
-    super::zhidao::get_zhidao_list(session).await.is_ok()
+pub async fn check_alive(session: &ZhsSession) -> Result<()> {
+    super::zhidao::get_zhidao_list(session).await.map(|_| ())
 }
 
 /// 时间戳工具（登录轮询用不到，供外部测试）。
