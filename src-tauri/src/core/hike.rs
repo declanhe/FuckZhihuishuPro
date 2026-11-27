@@ -309,8 +309,19 @@ impl HikeRunner {
                     .await
                 {
                     Ok(ret_time) => {
-                        prev_time = ret_time;
-                        played_time = ret_time;
+                        // 【防 -8 进度倒退】服务器返回的累计时长若异常小于当前值，
+                        // 不采信（否则下次上报 endWatchTime 倒退会被判"学习总时长下降"）。
+                        if ret_time >= prev_time {
+                            prev_time = ret_time;
+                            played_time = ret_time;
+                        } else {
+                            // 服务器值倒退（异常）：上报其实已成功，不重复提交同一段进度。
+                            // 保留 prev_time 不动，直接结束该视频避免陷入重复上报。
+                            emit.emit(CourseEvent::Failed {
+                                msg: "服务器返回的进度倒退，已跳过重复上报".into(),
+                            });
+                            break;
+                        }
                         // 【风控关键】终点已成功上报，必须退出循环！
                         // 否则 played 被钉死在 end_time，下面的 while 条件恒真，
                         // 每秒重复上报同一段进度 → 服务器判定异常 → 账号级 -12 限制。

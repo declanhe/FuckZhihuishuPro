@@ -192,6 +192,10 @@ pub struct ZhidaoRunner {
     fucked_time: u64,
     /// 伪装观看后台任务的终止句柄（切视频/停止时掐断旧任务，防残留请求）
     fake_watch_guard: std::sync::Mutex<Option<Arc<StopHandle>>>,
+    /// 每个视频已成功上报的最高进度（秒）。
+    /// 【防 -8】会话自愈重载后 queryStudyInfo 可能返回比实际已上报更小的旧进度，
+    /// 若直接采信会上报倒退值 → 服务器报 -8"学习总时长下降了"。用本表取 max 杜绝倒退。
+    reported_progress: HashMap<String, f64>,
 }
 
 impl ZhidaoRunner {
@@ -213,6 +217,7 @@ impl ZhidaoRunner {
             ctx: None,
             fucked_time: 0,
             fake_watch_guard: std::sync::Mutex::new(None),
+            reported_progress: HashMap::new(),
         }
     }
 
@@ -432,7 +437,14 @@ impl ZhidaoRunner {
         let Some(video) = ctx.videos.iter().find(|v| v.video_id == video_id).cloned() else {
             return Err(ZhsError::msg(format!("视频 {video_id} 不存在")));
         };
-        let mut played_time = video.study_total_time;
+        // 【防 -8】起始进度取"服务器报告值"与"本轮已成功上报的最高值"的较大者，
+        // 会话自愈重载后 queryStudyInfo 若返回旧值也不会倒退。
+        let mut played_time = self
+            .reported_progress
+            .get(&video.video_id)
+            .copied()
+            .unwrap_or(0.0)
+            .max(video.study_total_time);
         if video.watch_state == 1.0 && self.end_thre <= 1.0 {
             emit.emit(CourseEvent::Skipped {
                 name: video.name.clone(),
@@ -683,7 +695,7 @@ impl ZhidaoRunner {
     /// 数据不自洽正是 -12 的诱因。原地重试保证每个周期的数据闭环。
     /// 返回 (是否成功, 是否遇到验证码)。
     async fn submit_once_with_relogin(
-        &self,
+        &mut self,
         rac_id: &str,
         ctx: &ZhidaoContext,
         video: &ZVideo,
@@ -700,7 +712,14 @@ impl ZhidaoRunner {
                 .save_database_interval(ctx, video, played_time, last_submit, watch_point, token_id)
                 .await
             {
-                Ok(()) => return (true, false),
+                Ok(()) => {
+                    // 【防 -8】记录成功上报的最高进度，后续（含会话自愈重载）绝不倒退
+                    let entry = self.reported_progress.entry(video.video_id.clone()).or_insert(0.0);
+                    if played_time > *entry {
+                        *entry = played_time;
+                    }
+                    return (true, false);
+                }
                 Err(ZhsError::Captcha) => {
                     emit.emit(CourseEvent::CaptchaRequired);
                     return (false, true);
