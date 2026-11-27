@@ -8,7 +8,7 @@ use rand::Rng;
 use serde_json::{json, Value};
 
 use super::error::{Result, ZhsError};
-use super::events::{sleep_or_stop, CourseEvent, Emitter, PauseToken, StopToken};
+use super::events::{sleep_or_stop, CourseEvent, Emitter, PauseToken, StopHandle, StopToken};
 use super::session::{now_ms, ZhsSession};
 
 const COURSE_LIST_URL: &str = "https://hikeservice.zhihuishu.com/student/course/aided/getMyCourseList";
@@ -81,6 +81,8 @@ pub struct HikeRunner {
     pub pause: PauseToken,
     root: Option<Value>,
     fucked_time: u64,
+    /// 伪装观看后台任务的终止句柄（切视频/停止时掐断旧任务，防残留请求）
+    fake_watch_guard: std::sync::Mutex<Option<Arc<StopHandle>>>,
 }
 
 impl HikeRunner {
@@ -101,6 +103,7 @@ impl HikeRunner {
             pause,
             root: None,
             fucked_time: 0,
+            fake_watch_guard: std::sync::Mutex::new(None),
         }
     }
 
@@ -190,8 +193,8 @@ impl HikeRunner {
             }
             // 全局暂停：等恢复后再处理下一个资源
             self.pause.wait_resume().await;
-            // 已看完则跳过
-            if study_time >= total_time * self.end_thre && total_time > 0.0 {
+            // 已看完则跳过（与原版一致：total_time=0 时 study_time>=0 成立也跳过）
+            if study_time >= total_time * self.end_thre {
                 emit.emit(CourseEvent::Skipped {
                     name: name.clone(),
                     reason: "watched".into(),
@@ -258,7 +261,8 @@ impl HikeRunner {
             .pointer("/dataId")
             .map(json_str)
             .unwrap_or_default();
-        let total_time = file_info["totalTime"].as_f64().unwrap_or(0.0);
+        // 与原版 int(file_info.totalTime) 一致，避免小数导致 endWatchTime 差 1 秒
+        let total_time = file_info["totalTime"].as_f64().unwrap_or(0.0).trunc();
 
         // 伪装真实观看
         self.watch_video_fake(&data_id);
@@ -268,6 +272,7 @@ impl HikeRunner {
         let mut played_time = prev_time;
         let end_time = (total_time * self.end_thre).max(1.0);
         let interval: i64 = 30;
+        let mut end_retries = 0u32; // 终点上报失败重试计数（防无限重复提交）
 
         emit.emit(CourseEvent::VideoStart {
             video_id: file_id.to_string(),
@@ -296,8 +301,9 @@ impl HikeRunner {
                 return Err(ZhsError::TimeLimit);
             }
             played_time = (played_time + self.speed).min(end_time);
+            let reached_end = played_time >= end_time;
             // 到达间隔或终点：上报进度（失败不终止，下个周期重试）
-            if played_time >= end_time || ((played_time - prev_time) as i64) % interval == 0 {
+            if reached_end || ((played_time - prev_time) as i64) % interval == 0 {
                 match self
                     .save_study_record(course_id, file_id, played_time, prev_time, start_date)
                     .await
@@ -305,12 +311,34 @@ impl HikeRunner {
                     Ok(ret_time) => {
                         prev_time = ret_time;
                         played_time = ret_time;
+                        // 【风控关键】终点已成功上报，必须退出循环！
+                        // 否则 played 被钉死在 end_time，下面的 while 条件恒真，
+                        // 每秒重复上报同一段进度 → 服务器判定异常 → 账号级 -12 限制。
+                        // 原版的 while <= 写法在 ret_time > end_time 时侥幸退出，
+                        // 我们的 min() 步进把它钉死，必须显式 break。
+                        if reached_end {
+                            break;
+                        }
                     }
                     Err(ZhsError::Stopped) => return Err(ZhsError::Stopped),
                     Err(e) => {
                         emit.emit(CourseEvent::Failed {
                             msg: format!("进度上报失败（将继续尝试）: {e}"),
                         });
+                        // 终点上报失败：有限次重试（最多 5 次，间隔 3s）。
+                        // 绝不能无限循环重复提交同一段进度——那是 -12 的直接诱因。
+                        if reached_end {
+                            end_retries += 1;
+                            if end_retries >= 5 {
+                                emit.emit(CourseEvent::Failed {
+                                    msg: "终点进度上报多次失败，跳过该视频（下轮会重刷）".into(),
+                                });
+                                break;
+                            }
+                            if sleep_or_stop(3.0, &self.stop).await {
+                                return Err(ZhsError::Stopped);
+                            }
+                        }
                     }
                 }
             }
@@ -380,28 +408,61 @@ impl HikeRunner {
     }
 
     /// 伪装视频观看请求（对应 `watchVideo`）。
+    ///
+    /// 【风控】绑定停止令牌 + 每个视频只留一个后台任务，切视频/停止时掐断旧的；
+    /// 视频流只读前 64KB，避免完整下载与长时间占用连接形成异常流量。
     fn watch_video_fake(&self, video_id: &str) {
         let session = self.session.clone();
         let video_id = video_id.to_string();
+        let stop = self.stop.clone();
+        let pause = self.pause.clone();
+        let mut guard = self.fake_watch_guard.lock().unwrap();
+        if let Some(old) = guard.take() {
+            old.stop();
+        }
+        let handle = Arc::new(StopHandle::new());
+        *guard = Some(handle.clone());
+        drop(guard);
+
+        let task_stop = handle.token();
         tokio::spawn(async move {
             let query = vec![
                 ("jsonpCallBack".to_string(), "result".to_string()),
                 ("videoID".to_string(), video_id.clone()),
                 ("_".to_string(), now_ms().to_string()),
             ];
-            let Ok(text) = session.get_text(INIT_VIDEO_URL, &query).await else {
-                return;
+            let text = tokio::select! {
+                _ = stop.wait() => return,
+                _ = task_stop.wait() => return,
+                r = session.get_text(INIT_VIDEO_URL, &query) => match r { Ok(t) => t, Err(_) => return },
             };
-            let Some(inner) = text.strip_prefix("result(").and_then(|t| t.strip_suffix(')')) else {
+            // 暂停时等恢复而非丢弃任务：避免整个视频期间只有上报、没有视频流请求
+            tokio::select! {
+                _ = stop.wait() => return,
+                _ = task_stop.wait() => return,
+                _ = pause.wait_resume() => {}
+            }
+            let Some(inner) = text
+                .strip_prefix("result(")
+                .and_then(|t| t.strip_suffix(')'))
+            else {
                 return;
             };
             let Ok(v) = serde_json::from_str::<Value>(inner) else {
                 return;
             };
-            let Some(line_url) = v.pointer("/result/lines/0/lineUrl").and_then(|u| u.as_str()) else {
+            let Some(line_url) = v
+                .pointer("/result/lines/0/lineUrl")
+                .and_then(|u| u.as_str())
+                .map(|s| s.to_string())
+            else {
                 return;
             };
-            let _ = session.get_text(line_url, &[]).await;
+            tokio::select! {
+                _ = stop.wait() => {}
+                _ = task_stop.wait() => {}
+                _ = session.get_text_prefix(&line_url, 64 * 1024) => {}
+            }
         });
     }
 }

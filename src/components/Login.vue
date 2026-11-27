@@ -110,6 +110,12 @@ async function pollQr() {
       stopPoll();
       emit("done");
       return;
+    } else if (r.status === "expired") {
+      // 过期：立即自动刷新（后端现在明确返回 expired，不再静默当 waiting）
+      qrError.value = t("login.expired");
+      polling = false;
+      await startQr();
+      return;
     }
     polling = false;
     pollTimer = window.setTimeout(pollQr, 800);
@@ -159,15 +165,28 @@ async function openBrowser() {
   }
 }
 
+// 【监听器泄漏修复】同步注册清理钩子（await 之后注册无效），
+// 并用 unmounted 标志处理异步注册期间组件已卸载的竞态。
+let unlistenBrowser: (() => void) | null = null;
+let unmounted = false;
+
 onMounted(async () => {
-  // 内嵌浏览器登录成功 -> 直接进入主界面
   const un = await listen("browser-login-success", () => {
     emit("done");
   });
-  onBeforeUnmount(un);
+  if (unmounted) {
+    un(); // 组件已卸载，立即释放监听器
+  } else {
+    unlistenBrowser = un;
+  }
 });
 
-onBeforeUnmount(stopPoll);
+onBeforeUnmount(() => {
+  unmounted = true;
+  stopPoll();
+  unlistenBrowser?.();
+  unlistenBrowser = null;
+});
 startQr();
 </script>
 

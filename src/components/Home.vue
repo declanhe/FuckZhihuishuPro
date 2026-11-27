@@ -386,10 +386,14 @@ function applyOrder(rows: CourseRow[]): CourseRow[] {
 }
 
 function persistOrder() {
-  localStorage.setItem(
-    ORDER_KEY,
-    JSON.stringify(courseList.value.map((c) => c.id))
-  );
+  try {
+    localStorage.setItem(
+      ORDER_KEY,
+      JSON.stringify(courseList.value.map((c) => c.id))
+    );
+  } catch {
+    /* 存储不可用（配额/策略）时静默，不影响拖拽操作 */
+  }
 }
 
 async function loadCourses() {
@@ -434,6 +438,25 @@ const dragCourse = computed(
   () => courseList.value.find((c) => c.id === dragId.value) || null
 );
 
+/** 重新采样列表几何（拖拽中滚动时调用，避免落点错位）。
+ *  只取真实课程行，排除末尾的全选行。 */
+function sampleDragGeometry(from: number): { top: number; height: number; selfLeft: number; selfWidth: number; selfTop: number } | null {
+  const box = courseListBox.value;
+  if (!box) return null;
+  const rows = Array.from(box.querySelectorAll(".course-list > .course-item")) as HTMLElement[];
+  if (rows.length < 2) return null;
+  const r0 = rows[0].getBoundingClientRect();
+  const r1 = rows[1].getBoundingClientRect();
+  const row = rows[Math.min(from, rows.length - 1)].getBoundingClientRect();
+  return {
+    top: r0.top,
+    height: r1.top - r0.top,
+    selfLeft: row.left,
+    selfWidth: row.width,
+    selfTop: row.top,
+  };
+}
+
 function onHandleDown(id: string, e: MouseEvent) {
   if (dropTimer) {
     clearTimeout(dropTimer);
@@ -441,30 +464,38 @@ function onHandleDown(id: string, e: MouseEvent) {
   }
   const list = courseList.value;
   const from = list.findIndex((c) => c.id === id);
-  const box = courseListBox.value;
-  if (from < 0 || !box || list.length < 2) return;
-  const items = Array.from(box.querySelectorAll(".course-item")) as HTMLElement[];
-  if (items.length < 2) return;
-  const r0 = items[0].getBoundingClientRect();
-  const r1 = items[1].getBoundingClientRect();
-  const self = items[from].getBoundingClientRect();
-  dragListTop = r0.top;
-  dragSlotH = r1.top - r0.top;
-  dragH.value = Math.round(r0.height);
+  if (from < 0 || list.length < 2) return;
+  const g = sampleDragGeometry(from);
+  if (!g) return;
+  dragListTop = g.top;
+  dragSlotH = g.height;
+  dragH.value = Math.round(g.height);
   dragStartY = e.clientY;
-  dragOrigTop = self.top;
+  dragOrigTop = g.selfTop;
   dragMoved = false;
   dragDropping.value = false;
   dragIndex.value = from;
   ghostStyle.value = {
-    left: self.left + "px",
-    top: self.top + "px",
-    width: self.width + "px",
+    left: g.selfLeft + "px",
+    top: g.selfTop + "px",
+    width: g.selfWidth + "px",
   };
   dragId.value = id;
   window.addEventListener("mousemove", onDragMove);
   window.addEventListener("mouseup", onDragFinish);
   window.addEventListener("blur", onDragFinish);
+  window.addEventListener("wheel", onDragScroll, { passive: true });
+}
+
+/** 拖拽中滚动：幽灵的绝对坐标要跟着内容一起移动，否则吸附位置错乱 */
+function onDragScroll() {
+  if (!dragId.value || dragDropping.value) return;
+  const g = sampleDragGeometry(dragIndex.value);
+  if (!g) return;
+  const dy = g.top - dragListTop;
+  dragListTop = g.top;
+  dragOrigTop += dy;
+  ghostStyle.value = { ...ghostStyle.value, top: parseFloat(ghostStyle.value.top || "0") + dy + "px" };
 }
 
 function onDragMove(e: MouseEvent) {
@@ -498,6 +529,7 @@ function onDragFinish() {
   window.removeEventListener("mousemove", onDragMove);
   window.removeEventListener("mouseup", onDragFinish);
   window.removeEventListener("blur", onDragFinish);
+  window.removeEventListener("wheel", onDragScroll);
   if (dragMoved) persistOrder();
   // 缩回原大小并吸附到落点槽位，然后移除幽灵、显示真实卡片
   dragDropping.value = true;
@@ -546,8 +578,10 @@ async function startPicked() {
     await resetRunView();
     const failed = await api.startCourses(picked as CourseItem[]);
     for (const c of picked) {
-      clearedIds.value.delete(c.id);
       doneIds.value.delete(c.id); // 重新开刷，摘掉"已完成"直到再次刷完
+      // 【防旧尾事件污染】延时解除屏蔽：旧任务的 done("stopped") 尾事件
+      // 往往晚于 startCourses 的返回，过早删除会让旧尾事件把新卡片标成"已停止"。
+      window.setTimeout(() => clearedIds.value.delete(c.id), 3000);
     }
     persistDone();
     tab.value = "run";
@@ -574,7 +608,12 @@ function applyQueueState(s: QueueState) {
   queueState.pending = s.pending;
   queueState.paused = s.paused;
   if (s.notice === "captcha_cleared") captchaNotice.value = true;
-  if (s.current) ensureRun(s.current.id, s.current.name);
+  // 【防僵尸卡片】清空/重新开始时，旧的 queue-state 快照可能仍带着旧 current，
+  // 若此时重建 run 卡片，随后的 done 尾事件又被 clearedIds 屏蔽 → 卡片永久卡"准备中"。
+  // 被清掉的 id 一律不再由队列快照复活。
+  if (s.current && !clearedIds.value.has(s.current.id)) {
+    ensureRun(s.current.id, s.current.name);
+  }
 }
 
 function isCurrent(id: string) {
@@ -646,7 +685,11 @@ function loadDoneIds(): string[] {
 }
 
 function persistDone() {
-  localStorage.setItem(DONE_KEY, JSON.stringify([...doneIds.value]));
+  try {
+    localStorage.setItem(DONE_KEY, JSON.stringify([...doneIds.value]));
+  } catch {
+    /* 存储不可用时静默 */
+  }
 }
 
 const runningCount = computed(
@@ -743,9 +786,10 @@ function skipReasonText(reason?: string): string {
 
 let unlisten: (() => void) | null = null;
 let unlistenQueue: (() => void) | null = null;
+let homeUnmounted = false;
 
 onMounted(async () => {
-  unlisten = await onCourseEvent(({ courseId, courseName, event }) => {
+  const unEvent = await onCourseEvent(({ courseId, courseName, event }) => {
     // 「清空全部」后忽略旧任务的尾巴事件（它们到达时 runs 已被清空）
     if (clearedIds.value.has(courseId)) return;
     const r = ensureRun(courseId, courseName);
@@ -863,8 +907,12 @@ onMounted(async () => {
       }
     }
   });
+  if (homeUnmounted) unEvent();
+  else unlisten = unEvent;
 
-  unlistenQueue = await onQueueState(applyQueueState);
+  const unQueue = await onQueueState(applyQueueState);
+  if (homeUnmounted) unQueue();
+  else unlistenQueue = unQueue;
 
   // 恢复队列与运行状态（页面刷新时）
   try {
@@ -877,6 +925,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  homeUnmounted = true;
   if (unlisten) unlisten();
   if (unlistenQueue) unlistenQueue();
   onDragFinish();
@@ -884,9 +933,11 @@ onBeforeUnmount(() => {
     clearTimeout(dropTimer);
     dropTimer = null;
   }
+  // 未执行的设置保存不能丢（用户改完立刻退出登录/关窗）
   if (saveTimer) {
     clearTimeout(saveTimer);
     saveTimer = null;
+    if (cfgLoaded) void doSaveCfg();
   }
 });
 
@@ -903,7 +954,8 @@ async function skipCurrent(id: string) {
 async function restartRun(r: RunState) {
   r.captcha = false;
   captchaNotice.value = false;
-  clearedIds.value.delete(r.id);
+  // 延时解除屏蔽，避免旧 captcha 尾事件覆盖重刷状态
+  window.setTimeout(() => clearedIds.value.delete(r.id), 3000);
   doneIds.value.delete(r.id);
   persistDone();
   try {
@@ -952,6 +1004,27 @@ async function loadCfg() {
 // 设置即改即存（无保存按钮、无提示）：深度监听 + 300ms 防抖
 let cfgLoaded = false;
 let saveTimer: number | null = null;
+
+/** 构造干净配置（非法输入不应让后端反序列化失败）：时限必须是非负整数。
+ *  注意不写回 cfg ref，否则会再次触发 watch 造成循环。 */
+function cleanCfg(): AppConfig {
+  const n = Number(cfg.value.limit_minutes);
+  const s = Number(cfg.value.speed);
+  return {
+    ...cfg.value,
+    limit_minutes: Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0,
+    speed: Number.isFinite(s) && s >= 0 ? s : 0,
+  };
+}
+
+async function doSaveCfg() {
+  try {
+    await api.saveConfig(cleanCfg());
+  } catch {
+    /* 保存失败静默，下次修改再试 */
+  }
+}
+
 watch(
   cfg,
   () => {
@@ -959,11 +1032,7 @@ watch(
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = window.setTimeout(async () => {
       saveTimer = null;
-      try {
-        await api.saveConfig(cfg.value);
-      } catch {
-        /* 保存失败静默，下次修改再试 */
-      }
+      await doSaveCfg();
     }, 300);
   },
   { deep: true }

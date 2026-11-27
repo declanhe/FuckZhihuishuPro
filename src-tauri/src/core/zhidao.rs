@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use super::crypto::{self, VIDEO_KEY, HOME_KEY};
 use super::error::{Result, ZhsError};
-use super::events::{sleep_or_stop, CourseEvent, Emitter, PauseToken, StopToken};
+use super::events::{sleep_or_stop, CourseEvent, Emitter, PauseToken, StopHandle, StopToken};
 use super::session::{b64_encode, ev_encode, now_ms, ZhsSession};
 
 const LIST_URL: &str =
@@ -72,8 +72,12 @@ pub struct ZVideo {
 pub struct ZhidaoContext {
     pub rac_id: String,
     pub recruit_id: String,
-    /// 课程自身 ID（courseInfo.courseId）
+    /// 视频清单里的 courseId（videolist.courseId）——prelearningNote/弹题用
     pub course_id: String,
+    /// queryCourse 的 courseInfo.courseId——saveDatabaseIntervalTimeV2 明文 courseId 用。
+    /// 原版这两个来源分开（见 fucker.py prelearningNote vs saveDatabaseIntervalTimeV2），
+    /// 若服务端两者不同，混用会导致进度上报的 courseId 错误。
+    pub study_course_id: String,
     pub course_name: String,
     pub videos: Vec<ZVideo>,
 }
@@ -186,6 +190,8 @@ pub struct ZhidaoRunner {
     ctx: Option<ZhidaoContext>,
     /// 本轮累计学习秒数（时限用）
     fucked_time: u64,
+    /// 伪装观看后台任务的终止句柄（切视频/停止时掐断旧任务，防残留请求）
+    fake_watch_guard: std::sync::Mutex<Option<Arc<StopHandle>>>,
 }
 
 impl ZhidaoRunner {
@@ -206,6 +212,7 @@ impl ZhidaoRunner {
             pause,
             ctx: None,
             fucked_time: 0,
+            fake_watch_guard: std::sync::Mutex::new(None),
         }
     }
 
@@ -275,6 +282,16 @@ impl ZhidaoRunner {
             .await?["data"]
             .clone();
         let course_id = json_str(&chapters["courseId"]);
+        // 原版 V2 上报用 queryCourse 的 courseInfo.courseId，与 videolist 的 courseId 分开取；
+        // 若该字段缺失，回退到 videolist 的 courseId（实测两者常相同）。
+        let study_course_id = {
+            let s = json_str(&course["courseInfo"]["courseId"]);
+            if s.is_empty() {
+                course_id.clone()
+            } else {
+                s
+            }
+        };
         let mut videos = parse_videos(&chapters);
 
         // 观看状态（lessonIds/videoIds 去重）
@@ -347,6 +364,7 @@ impl ZhidaoRunner {
             rac_id: rac_id.to_string(),
             recruit_id,
             course_id,
+            study_course_id,
             course_name,
             videos,
         };
@@ -498,7 +516,6 @@ impl ZhidaoRunner {
         let mut question: Option<Value> = None;
         let mut report = false;
         let mut human_pause: i64 = 0; // 随机模拟人类暂停（区别于全局暂停）
-        let mut relogged = false; // 学习会话自愈：每个视频最多恢复一次
         let mut wp = crypto::WatchPoint::new();
 
         while played_time < end_time {
@@ -593,37 +610,26 @@ impl ZhidaoRunner {
                 report = false;
                 wp.add(played_time as i64, None);
                 let watch_point = wp.get();
-                // 上报失败分类处理：验证码必须停止（继续重试会加重风控）；
-                // 其他错误（网络抖动等）记录后下个周期重试
-                if let Err(e) = self
-                    .save_database_interval(
-                        &ctx,
-                        &video,
-                        played_time,
-                        last_submit,
-                        &watch_point,
-                        &token_id,
+                let (ok, captcha) = self
+                    .submit_once_with_relogin(
+                        rac_id, &ctx, &video, played_time, last_submit, &watch_point,
+                        &token_id, true, emit,
                     )
-                    .await
-                {
-                    if matches!(e, ZhsError::Captcha) {
-                        emit.emit(CourseEvent::CaptchaRequired);
-                        return Err(ZhsError::Captcha);
-                    }
-                    // 学习会话失效：重新跨站登录，下个周期重报（每个视频最多一次）
-                    if matches!(e, ZhsError::NotLoggedIn) && !relogged {
-                        relogged = true;
-                        emit.emit(CourseEvent::log("学习会话失效，正在自动恢复…"));
-                        if self.gologin(rac_id).await.is_ok() {
-                            continue;
-                        }
-                    }
-                    emit.emit(CourseEvent::Failed {
-                        msg: format!("进度上报失败（将继续尝试）: {e}"),
-                    });
-                } else {
+                    .await;
+                if captcha {
+                    return Err(ZhsError::Captcha);
+                }
+                if ok {
                     last_submit = played_time;
                     wp.reset(played_time as i64);
+                } else {
+                    // 【风控】失败也必须 reset watch point，防止跨周期累积膨胀。
+                    // 原版无论成功与否都 wp.reset，本周期的点已在上面 add 过，
+                    // 下个周期从当前 played_time 重新采样即可。
+                    wp.reset(played_time as i64);
+                    emit.emit(CourseEvent::Failed {
+                        msg: "进度上报失败（将在下个周期重试）".into(),
+                    });
                 }
             }
             emit.emit(CourseEvent::VideoProgress {
@@ -634,12 +640,33 @@ impl ZhidaoRunner {
                 quiz: answer.is_some(),
             });
         }
-        // 收尾上报已在循环内完成（played_time >= end_time 分支）
+        // 【风控】终点补偿：循环内最后一次上报若失败，last_submit 会落后于
+        // played_time。此时绝不能发 VideoDone——否则服务器停留在旧进度，
+        // 下一轮重刷同一段 = 进度反复上报 = -12。这里强制同步补报一次。
+        if last_submit < played_time {
+            wp.add(played_time as i64, None);
+            let watch_point = wp.get();
+            let (ok, captcha) = self
+                .submit_once_with_relogin(
+                    rac_id, &ctx, &video, played_time, last_submit, &watch_point,
+                    &token_id, true, emit,
+                )
+                .await;
+            if captcha {
+                return Err(ZhsError::Captcha);
+            }
+            if !ok {
+                emit.emit(CourseEvent::Failed {
+                    msg: "终点进度上报失败，本视频将不计入完成（下轮重刷）".into(),
+                });
+                // 不返回 Stopped/TimeLimit，让外层把它当作普通失败记录，
+                // 继续下一个视频；这个视频服务器没记录，下轮会重新刷。
+                return Ok(());
+            }
+            last_submit = played_time;
+        }
         let tail_sleep = rand::rng().random::<f64>() + 1.0;
         if sleep_or_stop(tail_sleep, &self.stop).await {
-            // 用户手动停止：不再补报——最后一次 30 秒上报已经是闭环数据，
-            // 服务器进度停在正确的位置，下次续播自然从那里开始。
-            // 强行补报（尤其 watch_point 不完整）反而可能污染进度状态。
             return Err(ZhsError::Stopped);
         }
         emit.emit(CourseEvent::VideoDone {
@@ -647,6 +674,48 @@ impl ZhidaoRunner {
             name: video.name.clone(),
         });
         Ok(())
+    }
+
+    /// 上报一次进度；若学习会话失效（NotLoggedIn）则重新 gologin 后**原地重试一次**。
+    ///
+    /// 【风控】不能用 continue 丢弃本次上报再等下个 30 秒周期——那样客户端进度
+    /// 已推进而服务器无记录，下次 playTimes 会包含 60 秒、watch point 却只覆盖部分，
+    /// 数据不自洽正是 -12 的诱因。原地重试保证每个周期的数据闭环。
+    /// 返回 (是否成功, 是否遇到验证码)。
+    async fn submit_once_with_relogin(
+        &self,
+        rac_id: &str,
+        ctx: &ZhidaoContext,
+        video: &ZVideo,
+        played_time: f64,
+        last_submit: f64,
+        watch_point: &str,
+        token_id: &str,
+        allow_relogin: bool,
+        emit: &Emitter,
+    ) -> (bool, bool) {
+        let mut relogin = allow_relogin;
+        loop {
+            match self
+                .save_database_interval(ctx, video, played_time, last_submit, watch_point, token_id)
+                .await
+            {
+                Ok(()) => return (true, false),
+                Err(ZhsError::Captcha) => {
+                    emit.emit(CourseEvent::CaptchaRequired);
+                    return (false, true);
+                }
+                Err(ZhsError::NotLoggedIn) if relogin => {
+                    relogin = false; // 每个上报点最多自愈一次，防止无限循环
+                    emit.emit(CourseEvent::log("学习会话失效，正在自动恢复…"));
+                    if self.gologin(rac_id).await.is_ok() {
+                        continue; // 原地重试本次上报（不是 while 的 continue）
+                    }
+                    return (false, false);
+                }
+                Err(_) => return (false, false),
+            }
+        }
     }
 
     fn check_limit(&self) -> Result<()> {
@@ -776,7 +845,7 @@ impl ZhidaoRunner {
             "ewssw": watch_point,
             "sdsew": ev_encode(&raw_ev),
             "zwsds": token_id,
-            "courseId": ctx.course_id,
+            "courseId": ctx.study_course_id,
         });
         self.session
             .zhidao_query(
@@ -792,18 +861,44 @@ impl ZhidaoRunner {
     }
 
     /// 伪装视频观看请求（对应 `watchVideo`，异步执行不阻塞）。
+    ///
+    /// 【风控】后台任务必须绑定停止令牌：暂停/跳过/清空后若旧任务仍在后台
+    /// 请求视频流，会形成"任务已停但服务器仍收到请求"的异常模式。
+    /// 同时每个视频最多一个伪装任务，切视频时旧的立即中断。
     fn watch_video_fake(&self, video_id: &str) {
         let session = self.session.clone();
         let video_id = video_id.to_string();
+        let stop = self.stop.clone();
+        let pause = self.pause.clone();
+        // 复用上一任伪装任务的"终止开关"：切换视频/停止时立刻掐断旧任务
+        let mut guard = self.fake_watch_guard.lock().unwrap();
+        if let Some(old) = guard.take() {
+            old.stop();
+        }
+        let handle = Arc::new(StopHandle::new());
+        *guard = Some(handle.clone());
+        drop(guard);
+
+        let task_stop = handle.token();
         tokio::spawn(async move {
             let query = vec![
                 ("jsonpCallBack".to_string(), "result".to_string()),
                 ("videoID".to_string(), video_id.clone()),
                 ("_".to_string(), now_ms().to_string()),
             ];
-            let Ok(text) = session.get_text(INIT_VIDEO_URL, &query).await else {
-                return;
+            // 用 select! 让请求可被停止/暂停打断
+            let text = tokio::select! {
+                _ = stop.wait() => return,
+                _ = task_stop.wait() => return,
+                r = session.get_text(INIT_VIDEO_URL, &query) => match r { Ok(t) => t, Err(_) => return },
             };
+            // 暂停时不要丢弃这个伪装观看任务——等恢复后继续请求视频流。
+            // 若直接 return，整个视频期间只有进度上报、没有视频流请求，是异常模式。
+            tokio::select! {
+                _ = stop.wait() => return,
+                _ = task_stop.wait() => return,
+                _ = pause.wait_resume() => {}
+            }
             let Some(inner) = text
                 .strip_prefix("result(")
                 .and_then(|t| t.strip_suffix(')'))
@@ -816,10 +911,16 @@ impl ZhidaoRunner {
             let Some(line_url) = v
                 .pointer("/result/lines/0/lineUrl")
                 .and_then(|u| u.as_str())
+                .map(|s| s.to_string())
             else {
                 return;
             };
-            let _ = session.get_text(line_url, &[]).await;
+            // 视频流可能很大：只读前 64KB 即可模拟"开始加载"，避免长时间占用连接
+            tokio::select! {
+                _ = stop.wait() => {}
+                _ = task_stop.wait() => {}
+                _ = session.get_text_prefix(&line_url, 64 * 1024) => {}
+            }
         });
     }
 }

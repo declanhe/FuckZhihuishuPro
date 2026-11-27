@@ -59,7 +59,10 @@ export const api = {
   qrLoginStart: () =>
     invoke<{ qrToken: string; img: string }>("qr_login_start"),
   qrLoginPoll: (qrToken: string) =>
-    invoke<{ status: string; msg?: string }>("qr_login_poll", { qrToken }),
+    invoke<{ status: "waiting" | "scanned" | "success" | "expired"; msg?: string }>(
+      "qr_login_poll",
+      { qrToken }
+    ),
   logout: () => invoke<void>("logout"),
   restoreLogin: () => invoke<boolean>("restore_login"),
   openBrowserLogin: () => invoke<void>("open_browser_login"),

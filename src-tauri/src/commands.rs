@@ -64,6 +64,8 @@ pub enum QrPoll {
     Waiting,
     Scanned { msg: String },
     Success,
+    /// 二维码已过期，前端应自动刷新
+    Expired,
 }
 
 fn err_to_string(e: ZhsError) -> String {
@@ -131,7 +133,9 @@ pub async fn qr_login_poll(
             state.save_cookies();
             Ok(QrPoll::Success)
         }
-        Err(ZhsError::QrExpired) => Ok(QrPoll::Waiting), // 由前端刷新二维码
+        // 明确返回 expired，让前端自动刷新——此前返回 Waiting 导致前端
+        // 的 qr_expired 分支永远不可达，过期后无限轮询失效二维码像"卡住"
+        Err(ZhsError::QrExpired) => Ok(QrPoll::Expired),
         Err(e) => Err(err_to_string(e)),
     }
 }

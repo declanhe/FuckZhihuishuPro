@@ -175,8 +175,13 @@ impl CookieStore for MemoryCookieStore {
                 };
                 match key.as_str() {
                     "domain" if !val.is_empty() => {
-                        cookie.domain = val.trim_start_matches('.').to_lowercase();
-                        cookie.host_only = false;
+                        let d = val.trim_start_matches('.').to_lowercase();
+                        // RFC 6265：只有当请求 host 是该 domain 的子域时才接受，
+                        // 否则退化为 host-only（防止 cookie 被投毒到无关父域）
+                        if host == d || host.ends_with(&format!(".{d}")) {
+                            cookie.domain = d;
+                            cookie.host_only = false;
+                        }
                     }
                     "path" if val.starts_with('/') => cookie.path = val,
                     "secure" => cookie.secure = true,

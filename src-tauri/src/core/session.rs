@@ -127,11 +127,17 @@ impl ZhsSession {
         self.uuid.lock().unwrap().is_some() && !self.store.export().is_empty()
     }
 
-    /// 发起请求并解析 JSON 响应（带重试，对照 fuckZHS 的 requests Retry）：
-    /// - 连接失败：所有方法都重试（连接没建立，服务器肯定没处理）
-    /// - 5xx 网关错误：GET 多次重试；POST 保守重试 1 次（防重复上报进度）
-    /// - 超时：GET 重试；POST 超时可能已到达服务器，不重试
-    /// - 4xx / 业务错误码 / 验证码：不重试，原样返回
+    /// 发起请求并解析 JSON 响应（带重试，严格对齐 fuckZHS 的 requests Retry）。
+    ///
+    /// 【重要 - 风控】只对**幂等方法**（GET/HEAD/OPTIONS）重试，POST **绝不重试**！
+    /// 原版 `urllib3.Retry` 的默认 allowed_methods 不含 POST——进度上报
+    /// `saveDatabaseIntervalTimeV2` 是 POST，原版从不重试它。
+    /// 一旦重试 POST，同一段进度会被重复上报，服务器判定异常 → 账号级 -12 验证码。
+    /// 这也是"明明串行刷课却仍被限制"的最可能根因。连接失败同理：即使 TCP 没连上，
+    /// 也不能赌服务器没处理（可能是响应丢失），POST 一律不重试。
+    ///
+    /// 幂等请求：连接失败 / 超时 / 5xx 各重试 3 次（对照原版 total=5）；
+    /// 4xx / 业务错误码 / 验证码：不重试，原样返回。
     async fn request(
         &self,
         method: Method,
@@ -140,7 +146,7 @@ impl ZhsSession {
         query: Option<&[(String, String)]>,
         form: Option<&[(String, String)]>,
     ) -> Result<Value> {
-        let is_get = method == Method::GET;
+        let retryable = matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
         let mut attempt = 0u32;
         loop {
             let res = self
@@ -150,26 +156,7 @@ impl ZhsSession {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     attempt += 1;
-                    let max_retries = match &e {
-                        ZhsError::Http(h) if h.is_connect() => 3,
-                        ZhsError::Http(h) if h.is_timeout() => {
-                            if is_get {
-                                3
-                            } else {
-                                0
-                            }
-                        }
-                        ZhsError::Http(h)
-                            if h.status().is_some_and(|s| s.as_u16() >= 500) =>
-                        {
-                            if is_get {
-                                3
-                            } else {
-                                1
-                            }
-                        }
-                        _ => 0,
-                    };
+                    let max_retries = max_retries_for(retryable, &e);
                     if attempt > max_retries {
                         return Err(e);
                     }
@@ -272,7 +259,8 @@ impl ZhsSession {
             .request(method, url, extra_headers, None, Some(&form))
             .await?;
         if let Some(ok) = ok_code {
-            let code = ret.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+            // code 字段可能是数字或字符串（与 hike 的 status 同类现象），两种都要兼容
+            let code = ret.get("code").and_then(parse_status_i64).unwrap_or(-1);
             if code != ok {
                 return match code {
                     -12 => Err(ZhsError::Captcha),
@@ -364,6 +352,38 @@ impl ZhsSession {
             .await?
             .error_for_status()?;
         Ok(resp.text().await?)
+    }
+
+    /// 只读响应前 max_bytes 字节（伪装观看视频流用，避免完整下载几十 MB）。
+    /// 不解析内容、不重试——纯粹模拟"浏览器开始加载视频"。
+    pub async fn get_text_prefix(&self, url: &str, max_bytes: usize) -> Result<()> {
+        let mut resp = self.client.get(url).send().await?.error_for_status()?;
+        let mut total = 0usize;
+        while total < max_bytes {
+            match resp.chunk().await? {
+                Some(c) => total += c.len(),
+                None => break,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 重试次数决策（纯函数，便于单测锁定风控行为）。
+/// POST 等非幂等方法一律 0 次——重复上报进度 = 账号级 -12。
+fn max_retries_for(retryable: bool, e: &ZhsError) -> u32 {
+    if !retryable {
+        return 0;
+    }
+    match e {
+        ZhsError::Http(h)
+            if h.is_connect()
+                || h.is_timeout()
+                || h.status().is_some_and(|s| s.as_u16() >= 500) =>
+        {
+            3
+        }
+        _ => 0,
     }
 }
 
@@ -468,6 +488,15 @@ pub fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 【风控回归锁】POST 等非幂等方法绝不重试：进度上报是 POST，
+    /// 重试会重复上报同一段进度 → 账号级 -12 限制。
+    #[test]
+    fn test_post_never_retries() {
+        let fake_http_err = ZhsError::msg("connection reset");
+        assert_eq!(max_retries_for(false, &fake_http_err), 0);
+        assert_eq!(max_retries_for(false, &ZhsError::Captcha), 0);
+    }
 
     #[test]
     fn test_percent_decode() {

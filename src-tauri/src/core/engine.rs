@@ -210,40 +210,71 @@ impl Engine {
 
     /// 启动监督任务：逐门取出队列课程执行；没有课程或遇到账号限制时结束。
     fn spawn_supervisor(&self, app: AppHandle, session: Arc<ZhsSession>, cfg: TaskConfig) {
-        {
-            let mut alive = lock_ok(&self.supervisor_alive);
-            if *alive {
-                return;
-            }
-            *alive = true;
-        }
-        let refs = self.refs.clone();
-        let alive = self.supervisor_alive.clone();
-
-        tauri::async_runtime::spawn(async move {
-            // 内层跑调度循环；外层兜底：内层 panic（内部 bug）也不许卡死队列——
-            // 清掉残留的 current、复位 alive 标志，并给那门课发终态事件。
-            let inner = {
-                let refs = refs.clone();
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    supervisor_loop(app, refs, session, cfg).await;
-                })
-            };
-            let _ = inner.await; // Err = panic，照样走下面的清理
-            let stale = lock_ok(&refs.current).take();
-            *lock_ok(&alive) = false;
-            if let Some((course, _)) = stale {
-                emit_course_event(
-                    &app,
-                    &course.id,
-                    &course.name,
-                    CourseEvent::done("error", "任务异常终止（内部错误），调度已恢复"),
-                );
-            }
-            refs.emit(&app, None);
-        });
+        spawn_supervisor_inner(
+            app,
+            session,
+            cfg,
+            self.refs.clone(),
+            self.supervisor_alive.clone(),
+        );
     }
+}
+
+/// 真正启动监督任务（自由函数，便于 cleanup 里重启）。
+///
+/// 【竞态修复】alive 标志、队列状态、current 的复位/检查必须在同一个临界区内完成：
+/// 旧 supervisor 结束时若队列里恰好有新入队的课，必须自己拉起新 supervisor，
+/// 否则新 enqueue 看到 alive=true 直接返回、旧 supervisor 又已 break → 任务永久滞留。
+fn spawn_supervisor_inner(
+    app: AppHandle,
+    session: Arc<ZhsSession>,
+    cfg: TaskConfig,
+    refs: QueueRefs,
+    alive: Arc<Mutex<bool>>,
+) {
+    {
+        let mut a = lock_ok(&alive);
+        if *a {
+            return;
+        }
+        *a = true;
+    }
+    tauri::async_runtime::spawn(async move {
+        // 内层跑调度循环；外层兜底：内层 panic（内部 bug）也不许卡死队列——
+        // 清掉残留的 current、复位 alive 标志，并给那门课发终态事件。
+        let inner = {
+            let refs = refs.clone();
+            let app = app.clone();
+            let session = session.clone();
+            let cfg = cfg.clone();
+            tauri::async_runtime::spawn(async move {
+                supervisor_loop(app, refs, session, cfg).await;
+            })
+        };
+        let _ = inner.await; // Err = panic，照样走下面的清理
+        let stale = lock_ok(&refs.current).take();
+        // 【原子交接】复位 alive 与检查队列在同一个 alive 锁的临界区内：
+        // 若队列非空，直接重新拉起监督（此时 alive 已从 true 置 true，不会重复）。
+        let need_restart = {
+            let mut a = lock_ok(&alive);
+            *a = false;
+            !lock_ok(&refs.queue).is_empty()
+        };
+        if let Some((course, _)) = stale {
+            emit_course_event(
+                &app,
+                &course.id,
+                &course.name,
+                CourseEvent::done("error", "任务异常终止（内部错误），调度已恢复"),
+            );
+        }
+        refs.emit(&app, None);
+        if need_restart {
+            // 队列里还有课（正常 supervisor_loop 退出只在队列空或 captcha 时，
+            // captcha 会清空队列，所以这里是竞态/异常路径），重新拉起
+            spawn_supervisor_inner(app, session, cfg, refs, alive);
+        }
+    });
 }
 
 /// 调度主循环：取课程 -> 注册为当前 -> 跑完 -> 出清，循环到队列空或遇到账号限制。
@@ -285,9 +316,12 @@ async fn supervisor_loop(app: AppHandle, refs: QueueRefs, session: Arc<ZhsSessio
 
         *lock_ok(&refs.current) = None;
         match result {
-            // 账号受限（code -12）：清空排队课程并停止调度，等用户人工处理
+            // 账号受限（code -12）：清空排队课程并停止调度，等用户人工处理。
+            // 必须复位 paused——否则用户处理完验证码后若之前处于暂停态，
+            // 重新入队的课程会卡在 wait_resume 永不开始。
             Err(ZhsError::Captcha) => {
                 lock_ok(&refs.queue).clear();
+                refs.paused.set(false);
                 refs.emit(&app, Some("captcha_cleared".to_string()));
                 break;
             }
