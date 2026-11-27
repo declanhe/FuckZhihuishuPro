@@ -198,6 +198,18 @@ pub struct ZhidaoRunner {
     reported_progress: HashMap<String, f64>,
 }
 
+/// 单次进度上报的结果（区分错误类型，便于上层正确处理与反馈）。
+enum SubmitOutcome {
+    /// 上报成功
+    Ok,
+    /// 账号被限制（-12）：必须停止整门课
+    Captcha,
+    /// 服务器进度领先（-8）：需要重新拉取服务器进度对齐后重报
+    ProgressBehind,
+    /// 其他错误（网络抖动等）：下个周期重试，msg 保留详情
+    Failed(String),
+}
+
 impl ZhidaoRunner {
     pub fn new(
         session: Arc<ZhsSession>,
@@ -620,28 +632,63 @@ impl ZhidaoRunner {
                 || report
             {
                 report = false;
-                wp.add(played_time as i64, None);
-                let watch_point = wp.get();
-                let (ok, captcha) = self
-                    .submit_once_with_relogin(
-                        rac_id, &ctx, &video, played_time, last_submit, &watch_point,
-                        &token_id, true, emit,
-                    )
-                    .await;
-                if captcha {
-                    return Err(ZhsError::Captcha);
-                }
-                if ok {
-                    last_submit = played_time;
-                    wp.reset(played_time as i64);
-                } else {
-                    // 【风控】失败也必须 reset watch point，防止跨周期累积膨胀。
-                    // 原版无论成功与否都 wp.reset，本周期的点已在上面 add 过，
-                    // 下个周期从当前 played_time 重新采样即可。
-                    wp.reset(played_time as i64);
-                    emit.emit(CourseEvent::Failed {
-                        msg: "进度上报失败（将在下个周期重试）".into(),
-                    });
+                // -8 自愈：最多重新同步 2 次进度后重报（服务器进度领先时对齐它）
+                let mut sync_attempts = 0u32;
+                loop {
+                    wp.add(played_time as i64, None);
+                    let watch_point = wp.get();
+                    match self
+                        .submit_once_with_relogin(
+                            rac_id, &ctx, &video, played_time, last_submit, &watch_point,
+                            &token_id, true, emit,
+                        )
+                        .await
+                    {
+                        SubmitOutcome::Ok => {
+                            last_submit = played_time;
+                            wp.reset(played_time as i64);
+                            break;
+                        }
+                        SubmitOutcome::Captcha => return Err(ZhsError::Captcha),
+                        SubmitOutcome::ProgressBehind if sync_attempts < 2 => {
+                            sync_attempts += 1;
+                            if let Some(server_progress) =
+                                self.fetch_video_progress(&ctx, &video).await
+                            {
+                                // 对齐服务器进度（取较大者，绝不倒退）后重试上报
+                                if server_progress > played_time {
+                                    emit.emit(CourseEvent::log(format!(
+                                        "已同步服务器进度 {:.0}s", server_progress
+                                    )));
+                                    played_time = server_progress;
+                                    last_submit = played_time;
+                                    wp.reset(played_time as i64);
+                                    continue;
+                                }
+                            }
+                            // 拉不到或没领先：作为普通失败处理
+                            wp.reset(played_time as i64);
+                            emit.emit(CourseEvent::Failed {
+                                msg: "进度上报失败：服务器进度领先但无法同步（将在下个周期重试）".into(),
+                            });
+                            break;
+                        }
+                        SubmitOutcome::Failed(msg) => {
+                            // 【风控】失败也必须 reset watch point，防止跨周期累积膨胀。
+                            wp.reset(played_time as i64);
+                            emit.emit(CourseEvent::Failed {
+                                msg: format!("进度上报失败（将在下个周期重试）: {msg}"),
+                            });
+                            break;
+                        }
+                        SubmitOutcome::ProgressBehind => {
+                            wp.reset(played_time as i64);
+                            emit.emit(CourseEvent::Failed {
+                                msg: "进度上报失败：服务器进度持续领先（已跳过本次）".into(),
+                            });
+                            break;
+                        }
+                    }
                 }
             }
             emit.emit(CourseEvent::VideoProgress {
@@ -656,18 +703,41 @@ impl ZhidaoRunner {
         // played_time。此时绝不能发 VideoDone——否则服务器停留在旧进度，
         // 下一轮重刷同一段 = 进度反复上报 = -12。这里强制同步补报一次。
         if last_submit < played_time {
-            wp.add(played_time as i64, None);
-            let watch_point = wp.get();
-            let (ok, captcha) = self
-                .submit_once_with_relogin(
-                    rac_id, &ctx, &video, played_time, last_submit, &watch_point,
-                    &token_id, true, emit,
-                )
-                .await;
-            if captcha {
-                return Err(ZhsError::Captcha);
+            // 终点同样处理 -8：先同步服务器进度再重报
+            let mut synced = false;
+            let mut sync_attempts = 0u32;
+            loop {
+                wp.add(played_time as i64, None);
+                let watch_point = wp.get();
+                match self
+                    .submit_once_with_relogin(
+                        rac_id, &ctx, &video, played_time, last_submit, &watch_point,
+                        &token_id, true, emit,
+                    )
+                    .await
+                {
+                    SubmitOutcome::Ok => {
+                        synced = true;
+                        last_submit = played_time;
+                        break;
+                    }
+                    SubmitOutcome::Captcha => return Err(ZhsError::Captcha),
+                    SubmitOutcome::ProgressBehind if sync_attempts < 2 => {
+                        sync_attempts += 1;
+                        if let Some(sp) = self.fetch_video_progress(&ctx, &video).await {
+                            if sp > played_time {
+                                played_time = sp;
+                                last_submit = sp;
+                                wp.reset(sp as i64);
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    _ => break,
+                }
             }
-            if !ok {
+            if !synced {
                 emit.emit(CourseEvent::Failed {
                     msg: "终点进度上报失败，本视频将不计入完成（下轮重刷）".into(),
                 });
@@ -675,7 +745,6 @@ impl ZhidaoRunner {
                 // 继续下一个视频；这个视频服务器没记录，下轮会重新刷。
                 return Ok(());
             }
-            last_submit = played_time;
         }
         let tail_sleep = rand::rng().random::<f64>() + 1.0;
         if sleep_or_stop(tail_sleep, &self.stop).await {
@@ -690,10 +759,37 @@ impl ZhidaoRunner {
 
     /// 上报一次进度；若学习会话失效（NotLoggedIn）则重新 gologin 后**原地重试一次**。
     ///
-    /// 【风控】不能用 continue 丢弃本次上报再等下个 30 秒周期——那样客户端进度
+    /// 重新拉取服务器上该视频的最新进度（-8 自愈用）。
+    /// 只请求 queryStudyInfo，不重载整门课上下文（更轻、更快）。
+    async fn fetch_video_progress(&self, ctx: &ZhidaoContext, video: &ZVideo) -> Option<f64> {
+        let states = self
+            .session
+            .zhidao_query(
+                STUDY_INFO_URL,
+                &json!({
+                    "lessonIds": [video.lesson_id.clone()],
+                    "lessonVideoIds": [video.small_id.clone()],
+                    "recruitId": ctx.recruit_id,
+                }),
+                VIDEO_KEY,
+                Some(0),
+                reqwest::Method::POST,
+                STUDY_HEADERS,
+            )
+            .await
+            .ok()?["data"]
+            .clone();
+        let state = states
+            .pointer(&format!("/lv/{}", video.small_id))
+            .filter(|s| s.is_object())
+            .or_else(|| states.pointer(&format!("/lesson/{}", video.lesson_id)))
+            .filter(|s| s.is_object());
+        state.map(|s| s["studyTotalTime"].as_f64().unwrap_or(0.0))
+    }
+
+/// 【风控】不能用 continue 丢弃本次上报再等下个 30 秒周期——那样客户端进度
     /// 已推进而服务器无记录，下次 playTimes 会包含 60 秒、watch point 却只覆盖部分，
     /// 数据不自洽正是 -12 的诱因。原地重试保证每个周期的数据闭环。
-    /// 返回 (是否成功, 是否遇到验证码)。
     async fn submit_once_with_relogin(
         &mut self,
         rac_id: &str,
@@ -705,7 +801,7 @@ impl ZhidaoRunner {
         token_id: &str,
         allow_relogin: bool,
         emit: &Emitter,
-    ) -> (bool, bool) {
+    ) -> SubmitOutcome {
         let mut relogin = allow_relogin;
         loop {
             match self
@@ -718,11 +814,15 @@ impl ZhidaoRunner {
                     if played_time > *entry {
                         *entry = played_time;
                     }
-                    return (true, false);
+                    return SubmitOutcome::Ok;
                 }
                 Err(ZhsError::Captcha) => {
                     emit.emit(CourseEvent::CaptchaRequired);
-                    return (false, true);
+                    return SubmitOutcome::Captcha;
+                }
+                Err(ZhsError::ProgressWentBackwards) => {
+                    emit.emit(CourseEvent::log("服务器进度领先，正在重新同步进度…"));
+                    return SubmitOutcome::ProgressBehind;
                 }
                 Err(ZhsError::NotLoggedIn) if relogin => {
                     relogin = false; // 每个上报点最多自愈一次，防止无限循环
@@ -730,9 +830,9 @@ impl ZhidaoRunner {
                     if self.gologin(rac_id).await.is_ok() {
                         continue; // 原地重试本次上报（不是 while 的 continue）
                     }
-                    return (false, false);
+                    return SubmitOutcome::Failed("会话恢复失败".into());
                 }
-                Err(_) => return (false, false),
+                Err(e) => return SubmitOutcome::Failed(e.to_string()),
             }
         }
     }

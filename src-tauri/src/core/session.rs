@@ -264,6 +264,9 @@ impl ZhsSession {
             if code != ok {
                 return match code {
                     -12 => Err(ZhsError::Captcha),
+                    // -8：服务器记录的进度领先于本次上报（"学习总时长下降了"）。
+                    // 单独分类，让 runner 能重新拉取服务器进度对齐，而不是傻傻重试。
+                    -8 => Err(ZhsError::ProgressWentBackwards),
                     _ => Err(ZhsError::msg(format!(
                         "code: {code} msg: {}",
                         ret.get("message")

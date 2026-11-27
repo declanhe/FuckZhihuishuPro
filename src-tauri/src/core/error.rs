@@ -39,6 +39,11 @@ pub enum ZhsError {
 
     #[error("任务已被用户停止")]
     Stopped,
+
+    /// 服务器报告"学习总时长下降了"（-8）：我们上报的进度落后于服务器记录。
+    /// 需要重新拉取服务器进度并对齐（不能继续按本地进度上报，否则 -8 持续）。
+    #[error("学习总时长下降了（服务器进度领先）")]
+    ProgressWentBackwards,
 }
 
 // WebView2 是 Windows 专属，该转换只在 Windows 上编译
@@ -66,6 +71,7 @@ impl ZhsError {
             Self::NotLoggedIn => "not_logged_in",
             Self::TimeLimit => "time_limit",
             Self::Stopped => "stopped",
+            Self::ProgressWentBackwards => "progress_went_backwards",
             _ => "error",
         }
     }
