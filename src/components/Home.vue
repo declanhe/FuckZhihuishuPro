@@ -895,10 +895,12 @@ onMounted(async () => {
         break;
       }
       case "failed": {
-        pushLog(r, "error", event.msg || "");
-        // 关键失败（账号被限制）时任务实际已停止，显示终态避免进度条凝固
+        // 后端分级：warn=可自愈的小问题（黄），error=确实失败（红）
+        pushLog(r, event.level === "warn" ? "warn" : "error", event.msg || "");
+        // 关键失败（账号被限制）时任务实际已停止，显示终态避免进度条凝固。
+        // 只有 error 级才判定——warn 是"不影响刷课"的小问题，不能误停任务。
         const msg = event.msg || "";
-        if (msg.includes("限制") || msg.includes("验证码")) {
+        if (event.level !== "warn" && (msg.includes("限制") || msg.includes("验证码"))) {
           r.done = true;
           r.captcha = true;
           r.doneTag = "tag.captcha";

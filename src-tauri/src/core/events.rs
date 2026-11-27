@@ -56,8 +56,19 @@ pub enum CourseEvent {
     LimitReached,
     /// 需要验证码
     CaptchaRequired,
-    /// 某项失败（不中断整体流程）
-    Failed { msg: String },
+    /// 某项失败（不中断整体流程）。
+    /// level：`warn` = 可自愈/可重试的小问题（黄字，不影响刷课）；
+    ///        `error` = 该项确实失败（红字）。
+    Failed {
+        msg: String,
+        #[serde(default = "default_error_level")]
+        level: String,
+    },
+}
+
+#[allow(dead_code)] // 供 serde 的 default 属性引用
+fn default_error_level() -> String {
+    "error".into()
 }
 
 impl CourseEvent {
@@ -77,6 +88,22 @@ impl CourseEvent {
             msg: msg.into(),
             code: Some(code.into()),
             arg: Some(arg.into()),
+        }
+    }
+
+    /// 可自愈的小问题（进度上报失败会重试等）——前端显示为黄色警告。
+    pub fn warn(msg: impl Into<String>) -> Self {
+        Self::Failed {
+            msg: msg.into(),
+            level: "warn".into(),
+        }
+    }
+
+    /// 该项确实失败——前端显示为红色错误。
+    pub fn fail(msg: impl Into<String>) -> Self {
+        Self::Failed {
+            msg: msg.into(),
+            level: "error".into(),
         }
     }
 

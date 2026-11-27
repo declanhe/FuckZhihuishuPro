@@ -134,7 +134,15 @@ impl HikeRunner {
 
     /// 刷整门课程（对应 `fuckHikeCourse` + `_traverse`）。
     pub async fn run_course(&mut self, course_id: &str, emit: &Emitter) -> Result<()> {
-        let root = self.root(course_id, emit).await?;
+        // 加载目录阶段也可能 -12，必须发 CaptchaRequired 让前端展示恢复引导
+        let root = match self.root(course_id, emit).await {
+            Ok(r) => r,
+            Err(ZhsError::Captcha) => {
+                emit.emit(CourseEvent::CaptchaRequired);
+                return Err(ZhsError::Captcha);
+            }
+            Err(e) => return Err(e),
+        };
         // queryResourceMenuTree 的 rt 直接是章节数组（实测），包裹成伪根节点
         // 统一交给 traverse 递归处理
         let pseudo_root = json!({
@@ -152,7 +160,7 @@ impl HikeRunner {
                 emit.emit(CourseEvent::CaptchaRequired);
                 return Err(ZhsError::Captcha);
             }
-            Err(e) => emit.emit(CourseEvent::Failed { msg: e.to_string() }),
+            Err(e) => emit.emit(CourseEvent::fail(e.to_string())),
         }
         Ok(())
     }
@@ -210,13 +218,17 @@ impl HikeRunner {
                     match r {
                         Ok(()) => {}
                         Err(ZhsError::Stopped) => return Err(ZhsError::Stopped),
+                        // 【关键】-12 账号限制必须立刻停止整门课：继续请求后面的视频
+                        // 会加重风控（原版也是 CaptchaException 直接 return）
+                        Err(ZhsError::Captcha) => {
+                            emit.emit(CourseEvent::CaptchaRequired);
+                            return Err(ZhsError::Captcha);
+                        }
                         Err(ZhsError::TimeLimit) => {
                             emit.emit(CourseEvent::LimitReached);
                             return Ok(());
                         }
-                        Err(e) => emit.emit(CourseEvent::Failed {
-                            msg: format!("视频 {name} 失败: {e}"),
-                        }),
+                        Err(e) => emit.emit(CourseEvent::fail(format!("视频 {name} 失败: {e}"))),
                     }
                 }
                 None => {
@@ -226,8 +238,12 @@ impl HikeRunner {
                     });
                 }
                 Some(_) => {
-                    // 其他资源类型：访问一次即可（对应 fuckFile）
-                    let _ = self.stu_view_file(course_id, &file_id).await;
+                    // 其他资源类型：访问一次即可（对应 fuckFile）。
+                    // 但 -12 必须立刻停止，不能当作普通失败忽略（会加重风控）。
+                    if let Err(ZhsError::Captcha) = self.stu_view_file(course_id, &file_id).await {
+                        emit.emit(CourseEvent::CaptchaRequired);
+                        return Err(ZhsError::Captcha);
+                    }
                     let view_sleep = rand::rng().random::<f64>() * 2.0 + 1.0;
                     if sleep_or_stop(view_sleep, &self.stop).await {
                         return Err(ZhsError::Stopped);
@@ -317,9 +333,9 @@ impl HikeRunner {
                         } else {
                             // 服务器值倒退（异常）：上报其实已成功，不重复提交同一段进度。
                             // 保留 prev_time 不动，直接结束该视频避免陷入重复上报。
-                            emit.emit(CourseEvent::Failed {
-                                msg: "服务器返回的进度倒退，已跳过重复上报".into(),
-                            });
+                            emit.emit(CourseEvent::warn(
+                                "服务器返回的进度倒退，已跳过重复上报",
+                            ));
                             break;
                         }
                         // 【风控关键】终点已成功上报，必须退出循环！
@@ -333,17 +349,17 @@ impl HikeRunner {
                     }
                     Err(ZhsError::Stopped) => return Err(ZhsError::Stopped),
                     Err(e) => {
-                        emit.emit(CourseEvent::Failed {
-                            msg: format!("进度上报失败（将继续尝试）: {e}"),
-                        });
+                        emit.emit(CourseEvent::warn(format!(
+                            "进度上报失败（将继续尝试）: {e}"
+                        )));
                         // 终点上报失败：有限次重试（最多 5 次，间隔 3s）。
                         // 绝不能无限循环重复提交同一段进度——那是 -12 的直接诱因。
                         if reached_end {
                             end_retries += 1;
                             if end_retries >= 5 {
-                                emit.emit(CourseEvent::Failed {
-                                    msg: "终点进度上报多次失败，跳过该视频（下轮会重刷）".into(),
-                                });
+                                emit.emit(CourseEvent::warn(
+                                    "终点进度上报多次失败，跳过该视频（下轮会重刷）",
+                                ));
                                 break;
                             }
                             if sleep_or_stop(3.0, &self.stop).await {

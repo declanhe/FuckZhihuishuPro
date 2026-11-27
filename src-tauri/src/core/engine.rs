@@ -389,7 +389,7 @@ async fn run_one_course(
             ));
         }
         Err(e) => {
-            emitter.emit(CourseEvent::Failed { msg: e.to_string() });
+            emitter.emit(CourseEvent::fail(e.to_string()));
             emitter.emit(CourseEvent::done("error", format!("任务异常结束: {e}")));
         }
     }

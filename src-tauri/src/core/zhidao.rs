@@ -391,7 +391,16 @@ impl ZhidaoRunner {
 
     /// 刷整门课程（对应 `fuckZhidaoCourse`）。
     pub async fn run_course(&mut self, rac_id: &str, emit: &Emitter) -> Result<()> {
-        let ctx = self.context(rac_id, emit).await?;
+        // 加载课程阶段也可能 -12（记忆：任务开头拉课程资源就能被限制）。
+        // 必须发出 CaptchaRequired，前端才会展示恢复引导。
+        let ctx = match self.context(rac_id, emit).await {
+            Ok(c) => c,
+            Err(ZhsError::Captcha) => {
+                emit.emit(CourseEvent::CaptchaRequired);
+                return Err(ZhsError::Captcha);
+            }
+            Err(e) => return Err(e),
+        };
         emit.emit(CourseEvent::logc(
             "start_course",
             format!("开始刷课：{}", ctx.course_name),
@@ -414,9 +423,7 @@ impl ZhidaoRunner {
                     return Ok(());
                 }
                 Err(e) => {
-                    emit.emit(CourseEvent::Failed {
-                        msg: format!("视频 {} 失败: {e}", video.name),
-                    });
+                    emit.emit(CourseEvent::fail(format!("视频 {} 失败: {e}", video.name)));
                 }
             }
         }
@@ -589,9 +596,7 @@ impl ZhidaoRunner {
                             report = true;
                         }
                         Err(e) => {
-                            emit.emit(CourseEvent::Failed {
-                                msg: format!("获取弹题失败: {e}"),
-                            });
+                            emit.emit(CourseEvent::warn(format!("获取弹题失败（不影响刷课）: {e}")));
                         }
                     }
                 }
@@ -606,9 +611,7 @@ impl ZhidaoRunner {
                         if let Err(e) =
                             self.save_popup_exam_answer(&ctx, &video, q, &ans).await
                         {
-                            emit.emit(CourseEvent::Failed {
-                                msg: format!("提交弹题答案失败: {e}"),
-                            });
+                            emit.emit(CourseEvent::warn(format!("提交弹题答案失败（不影响刷课）: {e}")));
                         } else {
                             emit.emit(CourseEvent::QuizAnswered {
                                 video_id: video.video_id.clone(),
@@ -668,24 +671,24 @@ impl ZhidaoRunner {
                             }
                             // 拉不到或没领先：作为普通失败处理
                             wp.reset(played_time as i64);
-                            emit.emit(CourseEvent::Failed {
-                                msg: "进度上报失败：服务器进度领先但无法同步（将在下个周期重试）".into(),
-                            });
+                            emit.emit(CourseEvent::warn(
+                                "进度上报失败：服务器进度领先但无法同步（将在下个周期重试）",
+                            ));
                             break;
                         }
                         SubmitOutcome::Failed(msg) => {
                             // 【风控】失败也必须 reset watch point，防止跨周期累积膨胀。
                             wp.reset(played_time as i64);
-                            emit.emit(CourseEvent::Failed {
-                                msg: format!("进度上报失败（将在下个周期重试）: {msg}"),
-                            });
+                            emit.emit(CourseEvent::warn(format!(
+                                "进度上报失败（将在下个周期重试）: {msg}"
+                            )));
                             break;
                         }
                         SubmitOutcome::ProgressBehind => {
                             wp.reset(played_time as i64);
-                            emit.emit(CourseEvent::Failed {
-                                msg: "进度上报失败：服务器进度持续领先（已跳过本次）".into(),
-                            });
+                            emit.emit(CourseEvent::warn(
+                                "进度上报失败：服务器进度持续领先（已跳过本次）",
+                            ));
                             break;
                         }
                     }
@@ -738,9 +741,9 @@ impl ZhidaoRunner {
                 }
             }
             if !synced {
-                emit.emit(CourseEvent::Failed {
-                    msg: "终点进度上报失败，本视频将不计入完成（下轮重刷）".into(),
-                });
+                emit.emit(CourseEvent::warn(
+                    "终点进度上报失败，本视频将不计入完成（下轮重刷）",
+                ));
                 // 不返回 Stopped/TimeLimit，让外层把它当作普通失败记录，
                 // 继续下一个视频；这个视频服务器没记录，下轮会重新刷。
                 return Ok(());
