@@ -44,7 +44,8 @@ pub async fn get_hike_list(session: &ZhsSession) -> Result<Vec<(String, String)>
             COURSE_LIST_URL,
             Some(&json!({"uuid": uuid, "data": data})),
             reqwest::Method::GET,
-            HIKE_HEADERS, // 原版对所有 hike 请求都带 Origin/Referer
+            // 原版 getHikeList 前只 _sessionReady()（基础头，无 Origin/Referer）
+            &[],
         )
         .await?;
     let mut courses = Vec::new();
@@ -461,7 +462,7 @@ impl HikeRunner {
             let text = tokio::select! {
                 _ = stop.wait() => return,
                 _ = task_stop.wait() => return,
-                r = session.get_text(INIT_VIDEO_URL, &query) => match r { Ok(t) => t, Err(_) => return },
+                r = session.get_text(INIT_VIDEO_URL, &query, HIKE_HEADERS) => match r { Ok(t) => t, Err(_) => return },
             };
             // 暂停时等恢复而非丢弃任务：避免整个视频期间只有上报、没有视频流请求
             tokio::select! {
@@ -488,7 +489,7 @@ impl HikeRunner {
             tokio::select! {
                 _ = stop.wait() => {}
                 _ = task_stop.wait() => {}
-                _ = session.get_text_prefix(&line_url, 64 * 1024) => {}
+                _ = session.get_text_prefix(&line_url, 64 * 1024, HIKE_HEADERS) => {}
             }
         });
     }

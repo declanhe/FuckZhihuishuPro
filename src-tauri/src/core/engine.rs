@@ -356,11 +356,22 @@ async fn run_one_course(
     }));
 
     emitter.emit(CourseEvent::logc("task_start", "任务开始", ""));
+    // 【对齐原版】为这门课创建独立会话（cookie 快照）：课程过程中服务器新下发的
+    // cookie 不影响会话状态，与原版 _sessionReady(ctx) 每视频重置的行为一致。
+    // gologin 等自愈请求也走这个独立会话，主会话保持干净。
+    let course_session = match session.snapshot_session() {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            emitter.emit(CourseEvent::fail(format!("创建课程会话失败: {e}")));
+            emitter.emit(CourseEvent::done("error", format!("任务异常结束: {e}")));
+            return Err(e);
+        }
+    };
     // 课程 ID 含字母 -> 知到共享课（recruitAndCourseId）；纯数字 -> 校内课（courseId）
     let is_zhidao = course.id.chars().any(|c| c.is_alphabetic());
     let result = if is_zhidao {
         let mut runner = ZhidaoRunner::new(
-            session.clone(),
+            course_session.clone(),
             cfg.speed,
             cfg.end_thre,
             cfg.limit_minutes,
@@ -370,7 +381,7 @@ async fn run_one_course(
         runner.run_course(&course.id, &emitter).await
     } else {
         let mut runner = HikeRunner::new(
-            session.clone(),
+            course_session.clone(),
             cfg.speed,
             cfg.end_thre,
             cfg.limit_minutes,

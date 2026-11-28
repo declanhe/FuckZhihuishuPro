@@ -74,6 +74,23 @@ impl ZhsSession {
         &self.client
     }
 
+    /// 创建一个"会话快照"：独立 client + 独立 cookie store，cookies 为当前的副本。
+    ///
+    /// 【对齐原版】原版 `_sessionReady(ctx)` 在每个视频前把 session 的 cookies/headers
+    /// 重置为课程加载时的快照——刷课过程中服务器新下发的 cookie 不会被采用，
+    /// 会话状态在整个课程内保持恒定。我们此前是全局共享 jar 全程演变，行为不同。
+    /// 每门课开始时调用一次本方法，课程内所有请求走这个快照会话。
+    pub fn snapshot_session(&self) -> Result<Self> {
+        let snap = Self::new()?;
+        let cookies = self.store.export();
+        snap.store.import(cookies);
+        // uuid 是从 CASLOGC 解析的，快照里需要同样可用
+        if let Some(u) = self.uuid() {
+            *snap.uuid.lock().unwrap() = Some(u);
+        }
+        Ok(snap)
+    }
+
     /// 当前登录 uuid（从 CASLOGC cookie 解析）。
     pub fn uuid(&self) -> Option<String> {
         self.uuid.lock().unwrap().clone()
@@ -255,8 +272,14 @@ impl ZhsSession {
             ("secretStr".to_string(), secret),
             ("dateFormate".to_string(), ts.to_string()),
         ];
+        // 【协议对齐】原版 _apiQuery：POST 用表单体，GET 用 URL 查询参数
+        // （requests.get(url, params=data)）。此前 GET 也把参数放 body——
+        // 服务器收不到参数（threeDimensionalCourseWare 曾因此失效）。
+        let is_get = method == Method::GET;
+        let (query, form): (Option<&[(String, String)]>, Option<&[(String, String)]>) =
+            if is_get { (Some(&form), None) } else { (None, Some(&form)) };
         let ret = self
-            .request(method, url, extra_headers, None, Some(&form))
+            .request(method, url, extra_headers, query, form)
             .await?;
         if let Some(ok) = ok_code {
             // code 字段可能是数字或字符串（与 hike 的 status 同类现象），两种都要兼容
@@ -345,12 +368,18 @@ impl ZhsSession {
         Ok(ret)
     }
 
-    /// 获取文本响应（用于 JSONP 等）。
-    pub async fn get_text(&self, url: &str, query: &[(String, String)]) -> Result<String> {
+    /// 获取文本响应（用于 JSONP 等）。extra_headers 原样附加（对齐原版 watchVideo 带 session headers）。
+    pub async fn get_text(
+        &self,
+        url: &str,
+        query: &[(String, String)],
+        extra_headers: &[(&str, &str)],
+    ) -> Result<String> {
         let resp = self
             .client
             .get(url)
             .query(query)
+            .headers(parse_extra_headers(extra_headers))
             .send()
             .await?
             .error_for_status()?;
@@ -359,8 +388,19 @@ impl ZhsSession {
 
     /// 只读响应前 max_bytes 字节（伪装观看视频流用，避免完整下载几十 MB）。
     /// 不解析内容、不重试——纯粹模拟"浏览器开始加载视频"。
-    pub async fn get_text_prefix(&self, url: &str, max_bytes: usize) -> Result<()> {
-        let mut resp = self.client.get(url).send().await?.error_for_status()?;
+    pub async fn get_text_prefix(
+        &self,
+        url: &str,
+        max_bytes: usize,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<()> {
+        let mut resp = self
+            .client
+            .get(url)
+            .headers(parse_extra_headers(extra_headers))
+            .send()
+            .await?
+            .error_for_status()?;
         let mut total = 0usize;
         while total < max_bytes {
             match resp.chunk().await? {
@@ -388,6 +428,20 @@ fn max_retries_for(retryable: bool, e: &ZhsError) -> u32 {
         }
         _ => 0,
     }
+}
+
+/// 把 (&str,&str) 头列表转为 HeaderMap（非法项忽略）。
+fn parse_extra_headers(headers: &[(&str, &str)]) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for (k, v) in headers {
+        if let (Ok(k), Ok(v)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(v),
+        ) {
+            map.insert(k, v);
+        }
+    }
+    map
 }
 
 /// 兼容数字与字符串两种状态的 status 解码（服务器两种都返回过）。

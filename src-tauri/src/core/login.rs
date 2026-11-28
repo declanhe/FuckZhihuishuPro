@@ -18,7 +18,8 @@ const QR_QUERY_URL: &str = "https://passport.zhihuishu.com/qrCodeLogin/getLoginQ
 
 const LOGIN_HEADERS: &[(&str, &str)] = &[
     ("Origin", "https://passport.zhihuishu.com"),
-    ("Referer", "https://passport.zhihuishu.com/"),
+    // 对齐原版 fucker.py:161-164：完整 login_page 作为 Referer
+    ("Referer", "https://passport.zhihuishu.com/login?service=https://onlineservice-api.zhihuishu.com/login/gologin"),
 ];
 
 /// 二维码轮询状态。
@@ -129,7 +130,7 @@ pub async fn login_password(session: &ZhsSession, username: &str, password: &str
         ("validate".to_string(), "0".to_string()),
     ];
     session
-        .get_text(LOGIN_PAGE, &query)
+        .get_text(LOGIN_PAGE, &query, LOGIN_HEADERS)
         .await
         .map_err(|e| ZhsError::msg(format!("登录跳转失败: {e}")))?;
 
@@ -140,8 +141,9 @@ pub async fn login_password(session: &ZhsSession, username: &str, password: &str
 /// 获取登录二维码（对应 `_qrlogin` 的第一步）。
 /// 返回 (qrToken, base64 图片数据)。
 pub async fn qr_start(session: &ZhsSession) -> Result<(String, String)> {
+    // 原版 _qrlogin 只 _sessionReady()（基础头，无 Origin/Referer）
     let r = session
-        .api_query(QR_IMG_URL, None, reqwest::Method::GET, LOGIN_HEADERS)
+        .api_query(QR_IMG_URL, None, reqwest::Method::GET, &[])
         .await?;
     let token = r
         .get("qrToken")
@@ -164,7 +166,8 @@ pub async fn qr_poll(session: &ZhsSession, qr_token: &str) -> Result<QrStatus> {
             QR_QUERY_URL,
             Some(&json!({ "qrToken": qr_token })),
             reqwest::Method::GET,
-            LOGIN_HEADERS,
+            // 对齐原版：无 Origin/Referer
+            &[],
         )
         .await?;
     match msg.get("status").and_then(|s| s.as_i64()) {
@@ -187,7 +190,7 @@ pub async fn qr_poll(session: &ZhsSession, qr_token: &str) -> Result<QrStatus> {
             }
             let query = vec![("pwd".to_string(), once_pwd)];
             session
-                .get_text(LOGIN_PAGE, &query)
+                .get_text(LOGIN_PAGE, &query, &[])
                 .await
                 .map_err(|e| ZhsError::msg(format!("二维码登录跳转失败: {e}")))?;
             session.finalize_login()?;

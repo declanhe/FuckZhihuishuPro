@@ -56,6 +56,13 @@ pub struct ZVideo {
     pub lesson_id: String,
     /// 所属章节 ID
     pub chapter_id: String,
+    /// 【对齐原版】服务器返回的原始类型 ID（通常为数字）。构造加密载荷时透传——
+    /// 原版载荷里是 `"lessonId":123`（数字），我们此前字符串化成 `"lessonId":"123"`，
+    /// 是与原版最大的字节级差异。
+    pub raw_video_id: Value,
+    pub raw_small_id: Value,
+    pub raw_lesson_id: Value,
+    pub raw_chapter_id: Value,
     pub chapter_name: String,
     pub lesson_name: String,
     pub name: String,
@@ -78,6 +85,10 @@ pub struct ZhidaoContext {
     /// 原版这两个来源分开（见 fucker.py prelearningNote vs saveDatabaseIntervalTimeV2），
     /// 若服务端两者不同，混用会导致进度上报的 courseId 错误。
     pub study_course_id: String,
+    /// 【对齐原版】原始类型的 ID（透传到加密载荷，见 ZVideo 注释）
+    pub raw_recruit_id: Value,
+    pub raw_course_id: Value,
+    pub raw_study_course_id: Value,
     pub course_name: String,
     pub videos: Vec<ZVideo>,
 }
@@ -137,7 +148,8 @@ fn parse_videos(chapters: &Value) -> Vec<ZVideo> {
                 }
             }
             for mut v in smalls {
-                v["chapterId"] = json!(chapter_id);
+                // 原始类型透传：原版 v.chapterId = chapter.id（保持服务器类型，通常数字）
+                v["chapterId"] = chapter["id"].clone();
                 let video_id = json_str(&v["videoId"]);
                 if video_id.is_empty() {
                     continue;
@@ -147,6 +159,10 @@ fn parse_videos(chapters: &Value) -> Vec<ZVideo> {
                     small_id: json_str(&v["id"]),
                     lesson_id: json_str(&v["lessonId"]),
                     chapter_id: json_str(&v["chapterId"]),
+                    raw_video_id: v["videoId"].clone(),
+                    raw_small_id: v["id"].clone(),
+                    raw_lesson_id: v["lessonId"].clone(),
+                    raw_chapter_id: v["chapterId"].clone(),
                     chapter_name: chapter_name.clone(),
                     lesson_name: lesson_name.clone(),
                     name: json_str(&v["name"]),
@@ -334,23 +350,33 @@ impl ZhidaoRunner {
                 s
             }
         };
+        let raw_recruit_id = course["recruitId"].clone();
+        let raw_course_id = chapters["courseId"].clone();
+        let raw_study_course_id = if course["courseInfo"]["courseId"].is_null() {
+            raw_course_id.clone()
+        } else {
+            course["courseInfo"]["courseId"].clone()
+        };
         let mut videos = parse_videos(&chapters);
 
-        // 观看状态（lessonIds/videoIds 去重）
-        let lesson_ids: Vec<Value> = videos
-            .iter()
-            .map(|v| v.lesson_id.clone())
-            .collect::<std::collections::HashSet<String>>()
-            .into_iter()
-            .map(Value::String)
-            .collect();
+        // 【对齐原版】lessonIds：全部 lesson id、按原插入序、不去重（fucker.py:389-393）；
+        // videoIds：按 videos 字典插入序、排除 id 为 0/空的（fucker.py:408）
+        let mut lesson_ids: Vec<Value> = Vec::new();
+        for chapter in chapters["videoChapterDtos"].as_array().unwrap_or(&vec![]).iter() {
+            for lesson in chapter["videoLessons"].as_array().unwrap_or(&vec![]).iter() {
+                lesson_ids.push(lesson["id"].clone());
+            }
+        }
         let video_ids: Vec<Value> = videos
             .iter()
-            .filter(|v| !v.small_id.is_empty() && v.small_id != "0")
-            .map(|v| v.small_id.clone())
-            .collect::<std::collections::HashSet<String>>()
-            .into_iter()
-            .map(Value::String)
+            .filter(|v| {
+                !(v.raw_small_id.is_null()
+                    || v.raw_small_id.as_i64() == Some(0)
+                    || v.raw_small_id.as_str() == Some("")
+                    || v.small_id.is_empty()
+                    || v.small_id == "0")
+            })
+            .map(|v| v.raw_small_id.clone())
             .collect();
         let states = self
             .session
@@ -359,7 +385,7 @@ impl ZhidaoRunner {
                 &json!({
                     "lessonIds": lesson_ids,
                     "lessonVideoIds": video_ids,
-                    "recruitId": recruit_id,
+                    "recruitId": raw_recruit_id,
                 }),
                 VIDEO_KEY,
                 Some(0),
@@ -407,6 +433,9 @@ impl ZhidaoRunner {
             recruit_id,
             course_id,
             study_course_id,
+            raw_recruit_id,
+            raw_course_id,
+            raw_study_course_id,
             course_name,
             videos,
         };
@@ -507,10 +536,10 @@ impl ZhidaoRunner {
             .zhidao_query(
                 VIDEO_POINTER_URL,
                 &json!({
-                    "lessonId": video.lesson_id,
-                    "lessonVideoId": video.small_id,
-                    "recruitId": ctx.recruit_id,
-                    "courseId": ctx.course_id,
+                    "lessonId": video.raw_lesson_id,
+                    "lessonVideoId": video.raw_small_id,
+                    "recruitId": ctx.raw_recruit_id,
+                    "courseId": ctx.raw_course_id,
                 }),
                 VIDEO_KEY,
                 Some(0),
@@ -549,7 +578,7 @@ impl ZhidaoRunner {
             .session
             .zhidao_query(
                 COURSEWARE_URL,
-                &json!({"videoId": video.video_id}),
+                &json!({"videoId": video.raw_video_id}),
                 VIDEO_KEY,
                 Some(0),
                 reqwest::Method::GET,
@@ -795,9 +824,9 @@ impl ZhidaoRunner {
             .zhidao_query(
                 STUDY_INFO_URL,
                 &json!({
-                    "lessonIds": [video.lesson_id.clone()],
-                    "lessonVideoIds": [video.small_id.clone()],
-                    "recruitId": ctx.recruit_id,
+                    "lessonIds": [video.raw_lesson_id.clone()],
+                    "lessonVideoIds": [video.raw_small_id.clone()],
+                    "recruitId": ctx.raw_recruit_id,
                 }),
                 VIDEO_KEY,
                 Some(0),
@@ -878,13 +907,13 @@ impl ZhidaoRunner {
     /// 获取学习令牌（对应 `prelearningNote`）。
     async fn prelearning_note(&self, ctx: &ZhidaoContext, video: &ZVideo) -> Result<String> {
         let data = json!({
-            "ccCourseId": ctx.course_id,
-            "chapterId": video.chapter_id,
+            "ccCourseId": ctx.raw_course_id,
+            "chapterId": video.raw_chapter_id,
             "isApply": 1,
-            "lessonId": video.lesson_id,
-            "lessonVideoId": video.small_id,
-            "recruitId": ctx.recruit_id,
-            "videoId": video.video_id,
+            "lessonId": video.raw_lesson_id,
+            "lessonVideoId": video.raw_small_id,
+            "recruitId": ctx.raw_recruit_id,
+            "videoId": video.raw_video_id,
         });
         let resp = self
             .session
@@ -912,8 +941,8 @@ impl ZhidaoRunner {
         question_ids: Value,
     ) -> Result<Value> {
         let data = json!({
-            "lessonId": video.lesson_id,
-            "lessonVideoId": video.small_id,
+            "lessonId": video.raw_lesson_id,
+            "lessonVideoId": video.raw_small_id,
             "questionIds": question_ids,
         });
         let resp = self
@@ -943,12 +972,12 @@ impl ZhidaoRunner {
         answer_ids: &str,
     ) -> Result<()> {
         let data = json!({
-            "courseId": ctx.course_id,
-            "recruitId": ctx.recruit_id,
+            "courseId": ctx.raw_course_id,
+            "recruitId": ctx.raw_recruit_id,
             "testQuestionId": question["questionId"],
             "isCurrent": "1",
-            "lessonId": video.lesson_id,
-            "lessonVideoId": video.small_id,
+            "lessonId": video.raw_lesson_id,
+            "lessonVideoId": video.raw_small_id,
             "answer": answer_ids,
             "testType": 0,
         });
@@ -995,7 +1024,7 @@ impl ZhidaoRunner {
             "ewssw": watch_point,
             "sdsew": ev_encode(&raw_ev),
             "zwsds": token_id,
-            "courseId": ctx.study_course_id,
+            "courseId": ctx.raw_study_course_id,
         });
         self.session
             .zhidao_query(
@@ -1040,7 +1069,7 @@ impl ZhidaoRunner {
             let text = tokio::select! {
                 _ = stop.wait() => return,
                 _ = task_stop.wait() => return,
-                r = session.get_text(INIT_VIDEO_URL, &query) => match r { Ok(t) => t, Err(_) => return },
+                r = session.get_text(INIT_VIDEO_URL, &query, STUDY_HEADERS) => match r { Ok(t) => t, Err(_) => return },
             };
             // 暂停时不要丢弃这个伪装观看任务——等恢复后继续请求视频流。
             // 若直接 return，整个视频期间只有进度上报、没有视频流请求，是异常模式。
@@ -1069,7 +1098,7 @@ impl ZhidaoRunner {
             tokio::select! {
                 _ = stop.wait() => {}
                 _ = task_stop.wait() => {}
-                _ = session.get_text_prefix(&line_url, 64 * 1024) => {}
+                _ = session.get_text_prefix(&line_url, 64 * 1024, STUDY_HEADERS) => {}
             }
         });
     }
