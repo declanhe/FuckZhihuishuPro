@@ -73,14 +73,17 @@ const zhCN: Record<string, string> = {
   "tag.limit": "已达时限",
   "tag.error": "已出错",
   "captcha.title": "⚠️ 账号被智慧树临时限制，刷课已暂停（不是软件坏了）",
-  "captcha.intro": "连续刷课被服务器怀疑了，人工验证一次就能恢复：",
-  "captcha.s1": "① 先等 30~60 分钟，期间别反复重试（越试限制越严）",
+  "captcha.intro":
+    "被限制后有一个 30~60 分钟的账号冷却期——冷却期内无论怎么重试都会再次失败，且每失败一次限制就加重一分。请严格按下面顺序操作，不要跳步、不要提前重试：",
+  "captcha.s1": "① 先等 30~60 分钟（期间千万别点重新开始，越早点越严重）",
   "captcha.s2": "② 用浏览器登录智慧树网页版，手动播放任意视频 1~2 分钟",
   "captcha.s3": "③ 回到这里，点左侧底部「退出登录」→ 重新扫码登录",
   "captcha.s4": "④ 先只挂一门课，等它跑完再挂下一门",
   "captcha.retry": "我已完成验证，重新开始刷课",
   "confirm.logout": "还有任务在刷课，退出登录将全部停止，确定？",
   "confirm.clearAll": "此操作不可撤销，确认删除？",
+  "confirm.cooldown":
+    "账号在 {0} 分钟前刚被限制，还在风控冷却期内（约 30~60 分钟）。\n\n现在重试大概率几分钟内又会失败，并且每次失败都会加重限制、延长冷却。\n\n建议：先等够 30~60 分钟 → 用浏览器登录智慧树网页版手动看 1~2 分钟视频 → 再重新扫码登录 → 只挂一门课。确定仍要立即重试？",
   "dlg.ok": "确定",
   "dlg.cancel": "取消",
 
@@ -194,14 +197,17 @@ const zhTW: Record<string, string> = {
   "tag.limit": "已達時限",
   "tag.error": "已出錯",
   "captcha.title": "⚠️ 帳號被智慧樹臨時限制，刷課已暫停（不是軟體壞了）",
-  "captcha.intro": "連續刷課被伺服器懷疑了，人工驗證一次就能恢復：",
-  "captcha.s1": "① 先等 30~60 分鐘，期間別反覆重試（越試限制越嚴）",
+  "captcha.intro":
+    "被限制後有一個 30~60 分鐘的帳號冷卻期——冷卻期內無論怎麼重試都會再次失敗，且每失敗一次限制就加重一分。請嚴格按下面順序操作，不要跳步、不要提前重試：",
+  "captcha.s1": "① 先等 30~60 分鐘（期間千萬別點重新開始，越早點越嚴重）",
   "captcha.s2": "② 用瀏覽器登入智慧樹網頁版，手動播放任意影片 1~2 分鐘",
   "captcha.s3": "③ 回到這裡，點左側底部「登出」→ 重新掃碼登入",
   "captcha.s4": "④ 先只掛一門課，等它跑完再掛下一門",
   "captcha.retry": "我已完成驗證，重新開始刷課",
   "confirm.logout": "還有任務在刷課，登出將全部停止，確定？",
   "confirm.clearAll": "此操作不可撤銷，確認刪除？",
+  "confirm.cooldown":
+    "帳號在 {0} 分鐘前剛被限制，還在風控冷卻期內（約 30~60 分鐘）。\n\n現在重試大概率幾分鐘內又會失敗，並且每次失敗都會加重限制、延長冷卻。\n\n建議：先等夠 30~60 分鐘 → 用瀏覽器登入智慧樹網頁版手動看 1~2 分鐘影片 → 再重新掃碼登入 → 只掛一門課。確定仍要立即重試？",
   "dlg.ok": "確定",
   "dlg.cancel": "取消",
 
@@ -313,9 +319,9 @@ const en: Record<string, string> = {
   "captcha.title":
     "⚠️ Your account was temporarily restricted by Zhihuishu. Studying is paused (the app is not broken).",
   "captcha.intro":
-    "The server got suspicious about non-stop studying. One manual verification fixes it:",
+    "After a restriction there is a 30–60 minute account cooldown — during it every retry fails again, and each failure deepens the restriction. Follow the steps below in order; don't skip ahead and don't retry early:",
   "captcha.s1":
-    "① Wait 30–60 minutes first; don't retry repeatedly (it makes it worse)",
+    "① Wait 30–60 minutes first (do NOT click restart during this — the earlier you retry, the worse it gets)",
   "captcha.s2":
     "② Log in to the Zhihuishu website in a browser and manually play any video for 1–2 minutes",
   "captcha.s3": "③ Come back here, click \"Log out\" at the bottom left, then scan the QR code to log in again",
@@ -324,6 +330,8 @@ const en: Record<string, string> = {
   "confirm.logout":
     "Tasks are still running. Logging out will stop them all. Continue?",
   "confirm.clearAll": "This cannot be undone. Delete everything?",
+  "confirm.cooldown":
+    "Your account was restricted {0} minute(s) ago and is likely still in the risk-control cooldown (about 30–60 minutes).\n\nRetrying now will most likely fail again within minutes — and every failure deepens the restriction and extends the cooldown.\n\nRecommended: wait 30–60 minutes → log in to the Zhihuishu website and manually play a video for 1–2 minutes → log in again via QR code → run only ONE course. Retry anyway?",
   "dlg.ok": "OK",
   "dlg.cancel": "Cancel",
 

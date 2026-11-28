@@ -196,7 +196,15 @@ pub struct ZhidaoRunner {
     /// 【防 -8】会话自愈重载后 queryStudyInfo 可能返回比实际已上报更小的旧进度，
     /// 若直接采信会上报倒退值 → 服务器报 -8"学习总时长下降了"。用本表取 max 杜绝倒退。
     reported_progress: HashMap<String, f64>,
+    /// 本次任务已执行的 gologin（跨站登录）次数。
+    /// 【防风暴】gologin 是登录类接口，高频调用本身就是异常行为。
+    /// 会话持续失效时若不限次，一个 30 分钟视频能调 60 次 → 加速风控。
+    /// 超过上限后停止自愈，明确提示用户重新扫码登录。
+    gologin_count: u32,
 }
+
+/// gologin 自愈的次数上限（整个课程任务）。
+const GOLOGIN_MAX: u32 = 3;
 
 /// 单次进度上报的结果（区分错误类型，便于上层正确处理与反馈）。
 enum SubmitOutcome {
@@ -230,6 +238,7 @@ impl ZhidaoRunner {
             fucked_time: 0,
             fake_watch_guard: std::sync::Mutex::new(None),
             reported_progress: HashMap::new(),
+            gologin_count: 0,
         }
     }
 
@@ -239,7 +248,23 @@ impl ZhidaoRunner {
 
     /// 跨站登录（对应 `gologin`）：建立 studyservice 学习会话。
     /// 会话失效（NotLoggedIn）时重新调用即可自愈，无需用户重新扫码。
-    async fn gologin(&self, rac_id: &str) -> Result<()> {
+    ///
+    /// 【防风暴】带次数上限：超过 GOLOGIN_MAX 次仍失效，说明会话已无法自愈
+    /// （很可能是账号处于风控状态），继续高频调用登录接口只会加重限制。
+    /// 此时返回明确错误，让用户退出登录重新扫码。
+    async fn gologin(&mut self, rac_id: &str, emit: &Emitter) -> Result<()> {
+        if self.gologin_count >= GOLOGIN_MAX {
+            return Err(ZhsError::msg(
+                "学习会话多次失效且无法自动恢复（账号可能被风控），请点左侧「退出登录」重新扫码后再试",
+            ));
+        }
+        self.gologin_count += 1;
+        if self.gologin_count > 1 {
+            emit.emit(CourseEvent::log(format!(
+                "第 {} 次重建学习会话…",
+                self.gologin_count
+            )));
+        }
         let fromurl = format!(
             "https://studyh5.zhihuishu.com/videoStudy.html#/studyVideo?recruitAndCourseId={rac_id}"
         );
@@ -268,7 +293,7 @@ impl ZhidaoRunner {
         ));
 
         // 跨站登录（studyservice 学习会话；过期后重新调用即可恢复）
-        self.gologin(rac_id).await?;
+        self.gologin(rac_id, emit).await?;
 
         // 课程信息
         let course = self
@@ -830,10 +855,13 @@ impl ZhidaoRunner {
                 Err(ZhsError::NotLoggedIn) if relogin => {
                     relogin = false; // 每个上报点最多自愈一次，防止无限循环
                     emit.emit(CourseEvent::log("学习会话失效，正在自动恢复…"));
-                    if self.gologin(rac_id).await.is_ok() {
+                    if self.gologin(rac_id, emit).await.is_ok() {
                         continue; // 原地重试本次上报（不是 while 的 continue）
                     }
-                    return SubmitOutcome::Failed("会话恢复失败".into());
+                    // gologin 次数用尽或失败：停止自愈，明确要求重新登录
+                    return SubmitOutcome::Failed(
+                        "学习会话多次失效，请退出登录重新扫码".into(),
+                    );
                 }
                 Err(e) => return SubmitOutcome::Failed(e.to_string()),
             }

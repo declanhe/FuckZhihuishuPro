@@ -8,6 +8,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use rand::Rng as _;
 use serde::Serialize;
 use serde_json::json;
 use tauri::{AppHandle, Emitter as _, Manager as _};
@@ -314,22 +315,28 @@ async fn supervisor_loop(app: AppHandle, refs: QueueRefs, session: Arc<ZhsSessio
         )
         .await;
 
-        *lock_ok(&refs.current) = None;
-        match result {
-            // 账号受限（code -12）：清空排队课程并停止调度，等用户人工处理。
-            // 必须复位 paused——否则用户处理完验证码后若之前处于暂停态，
-            // 重新入队的课程会卡在 wait_resume 永不开始。
-            Err(ZhsError::Captcha) => {
-                lock_ok(&refs.queue).clear();
-                refs.paused.set(false);
-                refs.emit(&app, Some("captcha_cleared".to_string()));
-                break;
+            *lock_ok(&refs.current) = None;
+            match result {
+                // 账号受限（code -12）：清空排队课程并停止调度，等用户人工处理。
+                // 必须复位 paused——否则用户处理完验证码后若之前处于暂停态，
+                // 重新入队的课程会卡在 wait_resume 永不开始。
+                Err(ZhsError::Captcha) => {
+                    lock_ok(&refs.queue).clear();
+                    refs.paused.set(false);
+                    refs.emit(&app, Some("captcha_cleared".to_string()));
+                    break;
+                }
+                _ => {
+                    refs.emit(&app, None);
+                }
             }
-            _ => {
-                refs.emit(&app, None);
+            // 【更像真人】课程之间随机冷却 3~8 秒：真人不会刷完一门瞬间切下一门。
+            // 冷却期间用户停止/清空的话，下一轮 pop 到 None 自然退出，无副作用。
+            if !lock_ok(&refs.queue).is_empty() {
+                let cooldown = rand::rng().random_range(3.0..8.0);
+                tokio::time::sleep(std::time::Duration::from_secs_f64(cooldown)).await;
             }
         }
-    }
 }
 
 /// 执行一门课程（阻塞到课程结束），返回课程最终结果供监督任务决策。

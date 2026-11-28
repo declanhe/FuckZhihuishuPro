@@ -670,6 +670,9 @@ interface RunState {
 
 const runs = reactive(new Map<string, RunState>());
 const skippedIds = ref(new Set<string>());
+/** 最近一次账号被限制（-12）的时间戳。【冷却保护】限制有账号级冷却期，
+ *  短时间内反复重开几乎必然再次失败，且会加重限制。 */
+let lastCaptchaAt = 0;
 /** 「清空全部」时记录被清掉的课程：忽略旧任务随后发来的尾巴事件，避免卡片复活 */
 const clearedIds = ref(new Set<string>());
 /** 刷完的课程（持久化）：清空刷课进度/重启后，「我的课程」仍显示"已完成" */
@@ -865,6 +868,7 @@ onMounted(async () => {
         r.done = true;
         r.captcha = true;
         r.doneTag = "tag.captcha";
+        lastCaptchaAt = Date.now();
         pushLog(r, "warn", t("log.captchaHit"));
         break;
       case "done": {
@@ -881,6 +885,7 @@ onMounted(async () => {
           // -12 在任务开头就被拦下时不会发 captcha_required，靠这里兜底展示引导
           r.captcha = true;
           r.doneTag = "tag.captcha";
+          lastCaptchaAt = Date.now();
         } else if (code === "stopped") {
           r.doneTag = skippedIds.value.has(courseId) ? "tag.skipped" : "tag.stopped";
         } else if (code === "error") {
@@ -904,6 +909,7 @@ onMounted(async () => {
           r.done = true;
           r.captcha = true;
           r.doneTag = "tag.captcha";
+          lastCaptchaAt = Date.now();
         }
         break;
       }
@@ -954,6 +960,17 @@ async function skipCurrent(id: string) {
 
 /** 完成人工验证后，从卡片上直接重新开始这门课 */
 async function restartRun(r: RunState) {
+  // 【冷却保护】-12 是账号级风控，有 30-60 分钟冷却期。
+  // 冷却期内反复重开几乎必然再次失败，且每次失败都会加重限制等级。
+  const sinceCaptcha = Date.now() - lastCaptchaAt;
+  if (sinceCaptcha < 30 * 60 * 1000) {
+    const mins = Math.max(1, Math.round((30 * 60 * 1000 - sinceCaptcha) / 60000));
+    const ok = await uiConfirm(
+      t("confirm.cooldown", mins),
+      { danger: true }
+    );
+    if (!ok) return;
+  }
   r.captcha = false;
   captchaNotice.value = false;
   // 延时解除屏蔽，避免旧 captcha 尾事件覆盖重刷状态

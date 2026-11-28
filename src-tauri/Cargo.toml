@@ -1,6 +1,6 @@
 [package]
 name = "fuckzhihuishupro"
-version = "1.0.2"
+version = "1.0.3"
 description = "FuckZhihuishuPro - 智慧树刷课助手，集 fuckZHS 与 Autovisor 之大成"
 authors = ["Declan He"]
 edition = "2024"
